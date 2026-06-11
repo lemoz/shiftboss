@@ -2976,7 +2976,7 @@ export function mergeProjectsByPath(
     } satisfies ProjectMergeResult;
   });
 
-  return mergeTx();
+  return mergeTx.immediate();
 }
 
 export function upsertProject(

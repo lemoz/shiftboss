@@ -425,7 +425,13 @@ async function runAutopilotCycle(): Promise<void> {
       if (!candidate) continue;
       try {
         enqueueCodexRun(project.id, candidate.id, null, "autopilot");
-      } catch {
+      } catch (err) {
+        console.error(
+          "[autopilot] failed to enqueue %s for project %s: %s",
+          candidate.id,
+          project.id,
+          err instanceof Error ? err.message : String(err)
+        );
         continue;
       }
     }

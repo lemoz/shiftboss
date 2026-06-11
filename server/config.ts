@@ -160,7 +160,7 @@ export function getHealthToken(): string {
 }
 
 export function getEscalationTimeoutHours(): number {
-  const raw = process.env.ESCALATION_TIMEOUT_HOURS;
+  const raw = readEnv("SHIFTBOSS_ESCALATION_TIMEOUT_HOURS", "ESCALATION_TIMEOUT_HOURS");
   const parsed = raw ? Number.parseFloat(raw) : NaN;
   if (Number.isFinite(parsed) && parsed > 0) return parsed;
   return 24;
@@ -586,12 +586,6 @@ export function getUseTsWorker(): boolean {
   return isTruthyEnv(readEnv("SHIFTBOSS_USE_TS_WORKER"));
 }
 
-export function getRemoteTestTimeoutSeconds(): number {
-  return parseNumberEnv(
-    readEnv("SHIFTBOSS_REMOTE_TEST_TIMEOUT_SEC"),
-    900
-  );
-}
 
 export function getOpenAiApiKey(): string | null {
   return trimEnvValue(process.env.OPENAI_API_KEY);

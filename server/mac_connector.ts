@@ -82,6 +82,7 @@ on json_escape(value)
   set value to my replace_text("\"", "\\\"", value)
   set value to my replace_text(return, "\\r", value)
   set value to my replace_text(linefeed, "\\n", value)
+  set value to my replace_text(tab, "\\t", value)
   return value
 end json_escape
 

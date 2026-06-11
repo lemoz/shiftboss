@@ -1537,7 +1537,7 @@ function copyContextFiles(params: {
     const destPath = path.join(contextRoot, dest);
     ensureDir(path.dirname(destPath));
     try {
-      fs.cpSync(source, destPath, { recursive: true });
+      fs.cpSync(source, destPath, { recursive: true, dereference: true });
       log(`[context_files] Copied ${source} → .context/${dest}`);
     } catch (err) {
       log(`[context_files] WARN: failed to copy ${source}: ${String(err)}`);
