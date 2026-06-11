@@ -172,6 +172,24 @@ const DEFAULT_MAX_ITERATIONS = 6;
 const DEFAULT_MAX_DURATION_MINUTES = 120;
 const DEFAULT_CHECKIN_MINUTES = 25;
 const DEFAULT_CHECKIN_DECISIONS = 5;
+// Minimum / maximum sleep allowed for a WAIT retry_after_minutes (minutes).
+export const WAIT_DELAY_MIN_MINUTES = 1;
+export const WAIT_DELAY_MAX_MINUTES = 60;
+// Brief pause between back-to-back iterations even when no WAIT is signaled,
+// so the loop does not spin at full speed when the agent is active.
+export const INTER_ITERATION_DELAY_MS = 5_000;
+
+/**
+ * Clamp a raw retry_after_minutes value from a WAIT decision to the sane
+ * [WAIT_DELAY_MIN_MINUTES, WAIT_DELAY_MAX_MINUTES] range.
+ * Returns WAIT_DELAY_MIN_MINUTES when the input is absent, non-finite, or <= 0.
+ */
+export function clampWaitMinutes(rawMinutes: unknown): number {
+  if (typeof rawMinutes === "number" && Number.isFinite(rawMinutes) && rawMinutes > 0) {
+    return Math.max(WAIT_DELAY_MIN_MINUTES, Math.min(WAIT_DELAY_MAX_MINUTES, rawMinutes));
+  }
+  return WAIT_DELAY_MIN_MINUTES;
+}
 
 const SESSION_STATE_TRANSITIONS: Record<GlobalAgentSessionState, GlobalAgentSessionState[]> = {
   onboarding: ["briefing"],
@@ -186,6 +204,26 @@ const SESSION_EVENT_LISTENERS = new Set<GlobalAgentSessionEventListener>();
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Like sleep(), but polls every SLEEP_POLL_INTERVAL_MS and resolves early when
+ * the session is no longer 'autonomous'.  This prevents a long WAIT delay from
+ * blocking session stop/pause for up to WAIT_DELAY_MAX_MINUTES.
+ */
+const SLEEP_POLL_INTERVAL_MS = 5_000;
+async function sleepInterruptible(ms: number, sessionId: string): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
+    await sleep(Math.min(SLEEP_POLL_INTERVAL_MS, remaining));
+    const s = getGlobalAgentSessionById(sessionId);
+    if (!s || s.state !== "autonomous") return;
+  }
 }
 
 export function registerGlobalAgentSessionEventListener(
@@ -1048,6 +1086,11 @@ async function runSessionLoop(sessionId: string): Promise<void> {
 
     const actionSummary = shiftResult.actions.map((action) => action.detail).join("; ");
     const checkIn = shouldTriggerCheckIn({ session: updated, now });
+
+    // Determine whether this iteration ended with a WAIT decision.
+    const lastAction = shiftResult.actions.at(-1);
+    const endedWithWait = lastAction?.action === "WAIT" && lastAction.ok;
+
     createSessionEvent({
       sessionId,
       type: "check_in",
@@ -1060,5 +1103,34 @@ async function runSessionLoop(sessionId: string): Promise<void> {
       },
       touchCheckIn: true,
     });
+
+    if (endedWithWait) {
+      // Honor the agent's requested retry delay (clamped to a sane range).
+      const clampedMinutes = clampWaitMinutes(shiftResult.wait_minutes);
+
+      // Additionally cap the WAIT sleep at the remaining session budget so the
+      // duration guard (checked at the top of the loop) is not bypassed by a
+      // long sleep that starts near the end of the allowed window.
+      const currentSession = getGlobalAgentSessionById(sessionId);
+      const startedAt = currentSession?.autonomous_started_at
+        ? Date.parse(currentSession.autonomous_started_at)
+        : NaN;
+      const maxDuration = resolveMaxDurationMinutes(updated.constraints);
+      const remainingMinutes = Number.isFinite(startedAt)
+        ? maxDuration - (Date.now() - startedAt) / 60_000
+        : maxDuration;
+      const delayMinutes = Math.min(clampedMinutes, Math.max(0, remainingMinutes));
+
+      if (delayMinutes > 0) {
+        // Use the interruptible variant so a stop/pause request is honoured
+        // within SLEEP_POLL_INTERVAL_MS rather than up to 60 minutes later.
+        await sleepInterruptible(delayMinutes * 60_000, sessionId);
+      }
+    } else {
+      // Small mandatory pause between back-to-back iterations so the loop
+      // does not spin at full speed when there is active work to do.
+      // 5 s is short enough that stop responsiveness is not materially affected.
+      await sleep(INTER_ITERATION_DELAY_MS);
+    }
   }
 }

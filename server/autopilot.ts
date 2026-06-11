@@ -4,6 +4,7 @@ import {
   getAutopilotPolicy,
   getDb,
   listEnabledAutopilotPolicies,
+  setWorkOrderNeedsHuman,
   updateAutopilotPolicy,
   type AutopilotPolicy,
   type AutopilotPolicyPatch,
@@ -73,6 +74,11 @@ const FAILED_STATUSES = new Set<RunRow["status"]>([
   "baseline_failed",
   "merge_conflict",
   "canceled",
+  // A user rejection is a strong negative signal — count it toward the
+  // consecutive-failure cap and pause the WO for human review (see
+  // markRejectedWorkOrderPaused).  Superseded runs are similarly non-passing.
+  "rejected",
+  "superseded",
 ]);
 const PASSED_STATUSES = new Set<RunRow["status"]>(["merged", "you_review"]);
 
@@ -136,7 +142,7 @@ function listReadyWorkOrderRows(projectId: string): WorkOrderRow[] {
     .prepare(
       `SELECT id, project_id, title, status, priority, tags, created_at, updated_at
        FROM work_orders
-       WHERE project_id = ? AND status = 'ready'
+       WHERE project_id = ? AND status = 'ready' AND needs_human = 0
        ORDER BY priority ASC, updated_at DESC`
     )
     .all(projectId) as WorkOrderRow[];
@@ -434,4 +440,16 @@ export function startAutopilotScheduler(): void {
     void runAutopilotCycle();
   }, CHECK_INTERVAL_MS);
   void runAutopilotCycle();
+}
+
+/**
+ * Called by the reject-run endpoint when triggered_by === 'autopilot'.
+ * Sets needs_human on the work order so autopilot skips it until a human
+ * edits the WO (which should call clearWorkOrderNeedsHuman).
+ */
+export function markRejectedWorkOrderPaused(
+  projectId: string,
+  workOrderId: string
+): void {
+  setWorkOrderNeedsHuman(projectId, workOrderId);
 }

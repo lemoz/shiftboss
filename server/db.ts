@@ -2263,12 +2263,18 @@ function initSchema(database: Database.Database) {
 
   const hasWorkOrderBaseBranch = workOrderColumns.some((c) => c.name === "base_branch");
   const hasWorkOrderTrackId = workOrderColumns.some((c) => c.name === "track_id");
+  const hasWorkOrderNeedsHuman = workOrderColumns.some((c) => c.name === "needs_human");
   if (!hasWorkOrderBaseBranch) {
     database.exec("ALTER TABLE work_orders ADD COLUMN base_branch TEXT;");
   }
   if (!hasWorkOrderTrackId) {
     database.exec(
       "ALTER TABLE work_orders ADD COLUMN track_id TEXT REFERENCES tracks(id) ON DELETE SET NULL;"
+    );
+  }
+  if (!hasWorkOrderNeedsHuman) {
+    database.exec(
+      "ALTER TABLE work_orders ADD COLUMN needs_human INTEGER NOT NULL DEFAULT 0;"
     );
   }
 
@@ -7077,6 +7083,68 @@ export function countReadyWorkOrders(projectId: string): number {
     .prepare("SELECT COUNT(*) as count FROM work_orders WHERE project_id = ? AND status = 'ready'")
     .get(projectId) as { count: number } | undefined;
   return row?.count ?? 0;
+}
+
+/**
+ * Mark a work order as needing human attention so autopilot skips it
+ * until a human edits the WO (which clears this flag via clearWorkOrderNeedsHuman).
+ */
+export function setWorkOrderNeedsHuman(
+  projectId: string,
+  workOrderId: string
+): void {
+  const database = getDb();
+  database
+    .prepare(
+      "UPDATE work_orders SET needs_human = 1 WHERE project_id = ? AND id = ?"
+    )
+    .run(projectId, workOrderId);
+}
+
+/**
+ * Clear the needs_human flag so autopilot will consider this work order again.
+ * Called when a human edits the work order markdown (via patchWorkOrder).
+ */
+export function clearWorkOrderNeedsHuman(
+  projectId: string,
+  workOrderId: string
+): void {
+  const database = getDb();
+  database
+    .prepare(
+      "UPDATE work_orders SET needs_human = 0 WHERE project_id = ? AND id = ?"
+    )
+    .run(projectId, workOrderId);
+}
+
+/** Returns true if the work order has the needs_human flag set. */
+export function getWorkOrderNeedsHuman(
+  projectId: string,
+  workOrderId: string
+): boolean {
+  const database = getDb();
+  const row = database
+    .prepare("SELECT needs_human FROM work_orders WHERE project_id = ? AND id = ?")
+    .get(projectId, workOrderId) as { needs_human: number } | undefined;
+  return (row?.needs_human ?? 0) === 1;
+}
+
+/**
+ * Returns a map of work_order_id → needs_human for all WOs in a project.
+ * Prefer this over N individual getWorkOrderNeedsHuman calls.
+ */
+export function listWorkOrderNeedsHumanFlags(
+  projectId: string
+): Map<string, boolean> {
+  const database = getDb();
+  const rows = database
+    .prepare("SELECT id, needs_human FROM work_orders WHERE project_id = ?")
+    .all(projectId) as Array<{ id: string; needs_human: number }>;
+  const map = new Map<string, boolean>();
+  for (const row of rows) {
+    map.set(row.id, row.needs_human === 1);
+  }
+  return map;
 }
 
 export function countShiftsSince(projectId: string, sinceIso: string): number {
