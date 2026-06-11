@@ -1,0 +1,52 @@
+{
+  "name": "shiftboss",
+  "private": true,
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lemoz/shiftboss"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/with-env.mjs NEXT_DIST_DIR=.next-dev -- next dev -p 3010",
+    "prebuild": "node scripts/clean-next-types.mjs",
+    "build": "next build",
+    "start": "next start -p 3010",
+    "lint": "next lint",
+    "server:dev": "node scripts/with-env.mjs CONTROL_CENTER_USE_TS_WORKER=1 -- tsx watch server/index.ts",
+    "server:build": "tsc -p server/tsconfig.json",
+    "server:start": "node server/dist/index.js",
+    "test:e2e": "node scripts/test-e2e.mjs",
+    "test:unit": "node --import tsx/esm --test server/*.test.js",
+    "test": "npm run test:unit"
+  },
+  "dependencies": {
+    "@elevenlabs/react": "^0.13.0",
+    "better-sqlite3": "^11.5.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "fast-glob": "^3.3.0",
+    "next": "^14.2.8",
+    "playwright": "^1.57.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "yaml": "^2.6.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.57.0",
+    "@types/better-sqlite3": "^7.6.10",
+    "@types/cors": "^2.8.17",
+    "@types/d3-force": "^3.0.10",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.17.12",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "d3-force": "^3.0.0",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "^14.2.8",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.2"
+  }
+}

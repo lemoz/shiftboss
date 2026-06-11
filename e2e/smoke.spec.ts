@@ -1,0 +1,487 @@
+import { expect, test } from "./fixtures";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import Database from "better-sqlite3";
+
+const e2eDir = path.dirname(fileURLToPath(import.meta.url));
+
+async function repoIdFromCard(card: import("@playwright/test").Locator): Promise<string> {
+  const href = await card.locator("a.stretchedLink").getAttribute("href");
+  if (!href) throw new Error("repo card missing href");
+  const parts = href.split("/").filter(Boolean);
+  return parts.at(-1) || href;
+}
+
+function waitForStarPatch(page: import("@playwright/test").Page, repoId: string) {
+  const expectedPath = `/api/repos/${encodeURIComponent(repoId)}/star`;
+  return page.waitForResponse(
+    (res) =>
+      res.request().method() === "PATCH" &&
+      new URL(res.url()).pathname === expectedPath
+  );
+}
+
+async function waitForStarToggle(card: import("@playwright/test").Locator) {
+  await card.scrollIntoViewIfNeeded();
+  const toggle = card.getByRole("button", { name: /Star project|Unstar project/ });
+  await toggle.scrollIntoViewIfNeeded();
+  await expect(toggle).toBeVisible();
+  await expect(toggle).toBeEnabled();
+  return toggle;
+}
+
+async function clickStarToggle(toggle: import("@playwright/test").Locator) {
+  // Use force:true because the stretched link overlay can intercept on mobile
+  await toggle.click({ force: true });
+}
+
+function waitForThreadPatch(page: import("@playwright/test").Page, threadId: string) {
+  const expectedPath = `/api/chat/threads/${encodeURIComponent(threadId)}`;
+  return page.waitForResponse(
+    (res) =>
+      res.request().method() === "PATCH" &&
+      new URL(res.url()).pathname === expectedPath
+  );
+}
+
+function trackPageErrors(page: import("@playwright/test").Page) {
+  const errors: string[] = [];
+  page.on("pageerror", (err) => errors.push(err.message));
+  page.on("console", (msg) => {
+    if (msg.type() === "error") errors.push(msg.text());
+  });
+  return errors;
+}
+
+const GLOBAL_NAV_LINKS = [
+  { href: "/", label: "Home" },
+  { href: "/observability", label: "Observability" },
+  { href: "/people", label: "People" },
+  { href: "/chat", label: "Chat" },
+  { href: "/settings", label: "Settings" },
+] as const;
+
+test.describe("Shiftboss smoke", () => {
+  test("Server health + repo scan endpoints respond", async ({ request }) => {
+    const apiPort = Number(
+      process.env.E2E_API_PORT ||
+        process.env.SHIFTBOSS_PORT ||
+        process.env.CONTROL_CENTER_PORT ||
+        4011
+    );
+    const apiBase = `http://127.0.0.1:${apiPort}`;
+
+    const health = await request.get(`${apiBase}/health`);
+    expect(health.ok()).toBe(true);
+    const healthJson = (await health.json()) as { ok?: boolean };
+    expect(healthJson.ok).toBe(true);
+
+    const scan = await request.post(`${apiBase}/repos/scan`);
+    expect(scan.ok()).toBe(true);
+    const scanJson = (await scan.json()) as { ok?: boolean; repos?: unknown };
+    expect(scanJson.ok).toBe(true);
+    expect(Array.isArray(scanJson.repos)).toBe(true);
+
+    const repos = await request.get(`${apiBase}/repos`);
+    expect(repos.ok()).toBe(true);
+    const reposJson = (await repos.json()) as Array<{ name?: unknown }> | unknown;
+    expect(Array.isArray(reposJson)).toBe(true);
+    const repoNames = Array.isArray(reposJson)
+      ? reposJson
+          .map((r) => (typeof r?.name === "string" ? r.name : null))
+          .filter((name): name is string => typeof name === "string")
+      : [];
+    expect(repoNames).toContain("alpha");
+    expect(repoNames).toContain("beta");
+  });
+
+  test("Portfolio loads without crashing", async ({ page }) => {
+    const errors = trackPageErrors(page);
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "Portfolio" })).toBeVisible();
+    expect(errors, `Console/page errors: ${errors.join("\n")}`).toEqual([]);
+  });
+
+  test("Mobile global nav stays single-row at required widths", async ({ page }) => {
+    const requiredPortraitViewports = [
+      { width: 390, height: 844 },
+      { width: 375, height: 812 },
+    ];
+    const requiredLandscapeViewports = [
+      { width: 844, height: 390 },
+      { width: 812, height: 375 },
+    ];
+    const requiredViewports = [...requiredPortraitViewports, ...requiredLandscapeViewports];
+
+    for (const viewport of requiredViewports) {
+      await page.setViewportSize(viewport);
+      await page.goto("/", { waitUntil: "networkidle" });
+
+      const navMetrics = await page.evaluate(() => {
+        const container = document.querySelector(".nav-links");
+        if (!container) return null;
+        const links = Array.from(container.querySelectorAll("a"));
+        const tops = new Set<number>();
+        const viewportWidth = window.innerWidth;
+
+        const allWithinViewport = links.every((link) => {
+          const rect = link.getBoundingClientRect();
+          tops.add(Math.round(rect.top));
+          return rect.left >= -0.5 && rect.right <= viewportWidth + 0.5;
+        });
+
+        return {
+          linkCount: links.length,
+          rowCount: tops.size,
+          allWithinViewport,
+        };
+      });
+
+      expect(navMetrics).not.toBeNull();
+      expect(navMetrics?.linkCount).toBe(GLOBAL_NAV_LINKS.length);
+      expect(navMetrics?.rowCount).toBe(1);
+      expect(navMetrics?.allWithinViewport).toBe(true);
+    }
+
+    for (const viewport of requiredPortraitViewports) {
+      await page.setViewportSize(viewport);
+      await page.goto("/", { waitUntil: "networkidle" });
+
+      const navStyles = await page.evaluate(() => {
+        const navBar = document.querySelector(".nav-bar");
+        const navInner = document.querySelector(".nav-bar-inner");
+        const navBarStyle = navBar ? getComputedStyle(navBar) : null;
+        const navInnerStyle = navInner ? getComputedStyle(navInner) : null;
+        return {
+          navPosition: navBarStyle?.position ?? null,
+          navBottom: navBarStyle?.bottom ?? null,
+          navInnerPaddingBottom: navInnerStyle?.paddingBottom ?? null,
+        };
+      });
+
+      expect(navStyles?.navPosition).toBe("fixed");
+      expect(navStyles?.navBottom).toBe("0px");
+      expect(Number.parseFloat(navStyles?.navInnerPaddingBottom || "0")).toBeGreaterThanOrEqual(
+        8
+      );
+    }
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    const globalNav = page.locator(".nav-links");
+    for (const { href, label } of GLOBAL_NAV_LINKS) {
+      await page.goto(href, { waitUntil: "networkidle" });
+      await expect(globalNav.getByRole("link", { name: label })).toHaveAttribute(
+        "aria-current",
+        "page"
+      );
+    }
+  });
+
+  test("Sidecar metadata renders on repo card", async ({ page }) => {
+    await page.goto("/");
+    const alphaCard = page.locator(".grid .card.cardLink", { hasText: "alpha" });
+    await expect(alphaCard.getByText("long_term")).toBeVisible();
+    await expect(alphaCard.getByText("building")).toBeVisible();
+    await expect(alphaCard.getByText("active")).toBeVisible();
+    await expect(alphaCard.getByText("p2")).toBeVisible();
+    await expect(alphaCard.getByText("demo")).toBeVisible();
+    await expect(alphaCard.getByText("sidecar")).toBeVisible();
+  });
+
+  test("Star/unstar reorder persists after refresh", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    const cards = page.locator(".grid .card.cardLink");
+
+    await expect(cards.first()).toContainText("alpha");
+
+    const betaCard = page.locator(".grid .card.cardLink", { hasText: "beta" });
+    const betaId = await repoIdFromCard(betaCard);
+    const betaStarToggle = await waitForStarToggle(betaCard);
+    const starResponse = waitForStarPatch(page, betaId);
+    await clickStarToggle(betaStarToggle);
+    expect((await starResponse).ok()).toBe(true);
+
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await expect(cards.first()).toContainText("beta");
+
+    const betaCardAfter = page.locator(".grid .card.cardLink", { hasText: "beta" });
+    const betaIdAfter = await repoIdFromCard(betaCardAfter);
+    const betaUnstarToggle = await waitForStarToggle(betaCardAfter);
+    const unstarResponse = waitForStarPatch(page, betaIdAfter);
+    await clickStarToggle(betaUnstarToggle);
+    expect((await unstarResponse).ok()).toBe(true);
+
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await expect(cards.first()).toContainText("alpha");
+  });
+
+  test("Star persists across repo ID migration", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+    const cards = page.locator(".grid .card.cardLink");
+
+    await expect(cards.first()).toContainText("alpha");
+
+    const betaCard = page.locator(".grid .card.cardLink", { hasText: "beta" });
+    const betaId = await repoIdFromCard(betaCard);
+    const betaStarToggle = await waitForStarToggle(betaCard);
+    const starResponse = waitForStarPatch(page, betaId);
+    await clickStarToggle(betaStarToggle);
+    expect((await starResponse).ok()).toBe(true);
+
+    const betaControlPath = path.join(
+      e2eDir,
+      ".tmp",
+      "repos",
+      "beta",
+      ".control.yml"
+    );
+    fs.writeFileSync(betaControlPath, "id: beta-stable\n", "utf8");
+
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await expect(cards.first()).toContainText("beta");
+
+    const betaCardAfter = page.locator(".grid .card.cardLink", { hasText: "beta" });
+    await expect(betaCardAfter.locator("a.stretchedLink")).toHaveAttribute(
+      "href",
+      "/projects/beta-stable"
+    );
+
+    const betaUnstarToggle = await waitForStarToggle(betaCardAfter);
+    const unstarResponse = waitForStarPatch(page, "beta-stable");
+    await clickStarToggle(betaUnstarToggle);
+    expect((await unstarResponse).ok()).toBe(true);
+
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    await expect(cards.first()).toContainText("alpha");
+  });
+
+  test("Star preserved when merging duplicate rows", async ({ page }) => {
+    const tmpDir = path.join(e2eDir, ".tmp");
+    const dbPath = path.join(tmpDir, "control-center-test.db");
+    const betaRepoPath = path.join(tmpDir, "repos", "beta");
+    const betaControlPath = path.join(betaRepoPath, ".control.yml");
+
+    fs.writeFileSync(betaControlPath, "id: beta-stable\n", "utf8");
+    await page.goto("/");
+
+    const db = new Database(dbPath);
+    const now = new Date().toISOString();
+
+    db.prepare("UPDATE projects SET starred = 0, updated_at = ? WHERE id = ?").run(
+      now,
+      "beta-stable"
+    );
+    db.prepare("DELETE FROM projects WHERE id = ?").run("beta-dup");
+    db.prepare(
+      `INSERT INTO projects
+        (id, path, name, description, type, stage, status, priority, starred, tags, last_run_at, created_at, updated_at)
+       VALUES
+        (@id, @path, @name, @description, @type, @stage, @status, @priority, @starred, @tags, @last_run_at, @created_at, @updated_at)`
+    ).run({
+      id: "beta-dup",
+      path: betaRepoPath,
+      name: "beta",
+      description: null,
+      type: "prototype",
+      stage: "idea",
+      status: "active",
+      priority: 3,
+      starred: 1,
+      tags: "[]",
+      last_run_at: null,
+      created_at: now,
+      updated_at: now,
+    });
+
+    db.exec(
+      `CREATE TABLE IF NOT EXISTS project_notes (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        note TEXT NOT NULL,
+        FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+      );`
+    );
+    db.prepare(
+      "INSERT OR REPLACE INTO project_notes (id, project_id, note) VALUES (?, ?, ?)"
+    ).run("beta-note", "beta-dup", "hello");
+    db.close();
+
+    await page.reload();
+
+    const dbAfter = new Database(dbPath);
+    const note = dbAfter
+      .prepare("SELECT project_id FROM project_notes WHERE id = ? LIMIT 1")
+      .get("beta-note") as { project_id: string } | undefined;
+    expect(note?.project_id).toBe("beta-stable");
+    const dupProject = dbAfter
+      .prepare("SELECT id FROM projects WHERE id = ? LIMIT 1")
+      .get("beta-dup") as { id: string } | undefined;
+    expect(dupProject).toBeUndefined();
+    dbAfter.close();
+
+    const cards = page.locator(".grid .card.cardLink");
+    await expect(cards.first()).toContainText("beta");
+
+    const betaCard = page.locator(".grid .card.cardLink", { hasText: "beta" });
+    await expect(betaCard.locator('button[aria-label="Unstar project"]')).toBeVisible();
+
+    const unstarResponse = waitForStarPatch(page, "beta-stable");
+    await betaCard.locator('button[aria-label="Unstar project"]').click();
+    expect((await unstarResponse).ok()).toBe(true);
+
+    await page.reload();
+    await expect(cards.first()).toContainText("alpha");
+  });
+
+  test("Repo move preserves stable sidecar id and history", async ({ page }) => {
+    const tmpDir = path.join(e2eDir, ".tmp");
+    const betaRepoPath = path.join(tmpDir, "repos", "beta");
+    const movedRepoPath = path.join(tmpDir, "repos", "beta-moved");
+    const betaControlPath = path.join(betaRepoPath, ".control.yml");
+
+    fs.writeFileSync(betaControlPath, "id: beta-stable\n", "utf8");
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+
+    const betaCard = page.locator(".grid .card.cardLink", { hasText: "beta" });
+    await expect(betaCard.locator("a.stretchedLink")).toHaveAttribute(
+      "href",
+      "/projects/beta-stable"
+    );
+
+    const betaStarToggle = await waitForStarToggle(betaCard);
+    if ((await betaStarToggle.getAttribute("aria-label")) === "Star project") {
+      const starResponse = waitForStarPatch(page, "beta-stable");
+      await clickStarToggle(betaStarToggle);
+      expect((await starResponse).ok()).toBe(true);
+      await expect(betaStarToggle).toHaveAttribute("aria-label", "Unstar project");
+    }
+
+    fs.renameSync(betaRepoPath, movedRepoPath);
+    try {
+      await page.reload({ waitUntil: "networkidle" });
+      const betaAfter = page.locator(".grid .card.cardLink", { hasText: "beta" });
+      await expect(betaAfter.locator("a.stretchedLink")).toHaveAttribute(
+        "href",
+        "/projects/beta-stable"
+      );
+      await expect(betaAfter).toContainText("beta-moved");
+      await expect(betaAfter).toBeVisible();
+      const betaAfterToggle = await waitForStarToggle(betaAfter);
+      await expect(betaAfterToggle).toHaveAttribute("aria-label", "Unstar project");
+    } finally {
+      if (fs.existsSync(movedRepoPath)) {
+        fs.renameSync(movedRepoPath, betaRepoPath);
+      }
+    }
+
+    await page.reload();
+    await page.waitForLoadState("networkidle");
+    const betaRestored = page.locator(".grid .card.cardLink", { hasText: "beta" });
+    const betaRestoredToggle = await waitForStarToggle(betaRestored);
+    if ((await betaRestoredToggle.getAttribute("aria-label")) === "Unstar project") {
+      const unstarResponse = waitForStarPatch(page, "beta-stable");
+      await clickStarToggle(betaRestoredToggle);
+      expect((await unstarResponse).ok()).toBe(true);
+      await expect(betaRestoredToggle).toHaveAttribute("aria-label", "Star project");
+    }
+  });
+
+  test("Invalid tags JSON never crashes /repos", async ({ page }) => {
+    const tmpDir = path.join(e2eDir, ".tmp");
+    const dbPath = path.join(tmpDir, "control-center-test.db");
+    const betaRepoPath = path.join(tmpDir, "repos", "beta");
+    const betaControlPath = path.join(betaRepoPath, ".control.yml");
+
+    fs.writeFileSync(betaControlPath, "id: beta-stable\n", "utf8");
+    await page.goto("/");
+
+    const db = new Database(dbPath);
+    db.prepare("UPDATE projects SET tags = ? WHERE path = ?").run(
+      "{not valid json",
+      betaRepoPath
+    );
+    db.close();
+
+    const errors = trackPageErrors(page);
+    await page.reload();
+    await expect(page.locator(".grid .card.cardLink", { hasText: "beta" })).toBeVisible();
+    expect(errors, `Console/page errors: ${errors.join("\n")}`).toEqual([]);
+
+    const dbAfter = new Database(dbPath);
+    const row = dbAfter
+      .prepare("SELECT tags FROM projects WHERE path = ? LIMIT 1")
+      .get(betaRepoPath) as { tags: string } | undefined;
+    expect(row?.tags).toBe("[]");
+    dbAfter.close();
+  });
+
+  test("Chat overlay deep link + rename/archive", async ({ page, request }) => {
+    const apiPort = Number(
+      process.env.E2E_API_PORT ||
+        process.env.SHIFTBOSS_PORT ||
+        process.env.CONTROL_CENTER_PORT ||
+        4011
+    );
+    const apiBase = `http://127.0.0.1:${apiPort}`;
+    const threadName = `E2E Chat ${Date.now()}`;
+
+    const createThread = await request.post(`${apiBase}/chat/threads`, {
+      data: { scope: "global", name: threadName },
+    });
+    expect(createThread.ok()).toBe(true);
+    const created = (await createThread.json()) as { id?: unknown };
+    expect(typeof created.id).toBe("string");
+    const threadId = String(created.id);
+
+    await page.goto(`/?chat=1&thread=${encodeURIComponent(threadId)}`);
+
+    const overlay = page.locator(".chat-overlay");
+    await expect(overlay).toBeVisible();
+    const header = page.locator(".chat-thread-active-header");
+    await expect(header.getByText(threadName)).toBeVisible();
+
+    await page.getByRole("button", { name: "Rename" }).click();
+    const renameSection = page.locator(".chat-thread-rename");
+    const renamed = `${threadName} renamed`;
+    await renameSection.getByRole("textbox").fill(renamed);
+    const renameResponse = waitForThreadPatch(page, threadId);
+    await renameSection.getByRole("button", { name: "Save" }).click();
+    expect((await renameResponse).ok()).toBe(true);
+    await expect(header.getByText(renamed)).toBeVisible();
+
+    const archiveResponse = waitForThreadPatch(page, threadId);
+    await page.getByRole("button", { name: "Archive" }).click();
+    expect((await archiveResponse).ok()).toBe(true);
+    await expect(page.getByRole("button", { name: "Unarchive" })).toBeVisible();
+    await expect(page.locator(".chat-thread-item.active").getByText("Archived")).toBeVisible();
+  });
+
+  test("Project page renders Kanban columns", async ({ page }) => {
+    await page.goto("/");
+    const alphaCard = page.locator(".grid .card.cardLink", { hasText: "alpha" });
+    await alphaCard.locator("a.stretchedLink").click();
+
+    const board = page.locator(".board");
+    await expect(board).toBeVisible();
+    await expect(board.getByText("Backlog", { exact: true })).toBeVisible();
+    await expect(board.getByText("Ready", { exact: true })).toBeVisible();
+    await expect(board.getByText("Building", { exact: true })).toBeVisible();
+    await expect(board.getByText("Done", { exact: true })).toBeVisible();
+  });
+
+  test("Server offline fallback renders", async ({ page }) => {
+    const offlinePort = Number(process.env.E2E_OFFLINE_WEB_PORT || 3013);
+    await page.goto(`http://localhost:${offlinePort}/`);
+    await expect(page.getByRole("heading", { name: "Portfolio" })).toBeVisible();
+    await expect(page.getByText("server offline or empty")).toBeVisible();
+    await expect(page.getByText("No repos yet")).toBeVisible();
+  });
+});

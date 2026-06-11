@@ -1,0 +1,6832 @@
+import "./env.js";
+import fs from "fs";
+import crypto from "crypto";
+import YAML from "yaml";
+import express, { type NextFunction, type Request, type Response } from "express";
+import cors from "cors";
+import {
+  getAllowLan,
+  getAllowRemoteHealth,
+  getAllowedOrigins,
+  getAppVersion,
+  getCorsAllowAllRequested,
+  getElevenLabsWebhookSecret,
+  getEscalationTimeoutHours,
+  getFailRunsOnRestart,
+  getHealthToken,
+  getGlobalAgentId,
+  getSlackOperatorV1Enabled,
+  getNodeEnvLabel,
+  getPccMode,
+  getServerHost,
+  getServerPort,
+  getServerUptimeSeconds,
+  isProductionEnv,
+} from "./config.js";
+import {
+  createUserInteraction,
+  createSubscriber,
+  createEscalation,
+  createProjectCommunication,
+  createGlobalPattern,
+  createGlobalShiftHandoff,
+  createShiftHandoff,
+  createSignal,
+  createConstitutionSuggestions,
+  createInitiative,
+  createPerson,
+  createPersonIdentifier,
+  createPersonProject,
+  CONVERSATION_CHANNELS,
+  deleteInitiative,
+  deletePerson,
+  deletePersonIdentifier,
+  deletePersonProject,
+  expireStaleGlobalShifts,
+  expireStaleShifts,
+  decideConstitutionSuggestion,
+  findProjectById,
+  findGlobalPatternById,
+  getDb,
+  getConstitutionSuggestionById,
+  getInitiativeById,
+  getActiveShift,
+  getActiveGlobalShift,
+  getEscalationById,
+  getIncidentStats,
+  getOpenEscalationForProject,
+  getProjectCommunicationById,
+  getRunById,
+  getLatestConstitutionSuggestionCreatedAt,
+  getEstimationContextSummary,
+  getRunPhaseMetricsSummary,
+  getConversationSummary,
+  updateRun,
+  getPersonById,
+  getPersonDetails,
+  getPersonProject,
+  getGlobalShiftById,
+  getShiftByProjectId,
+  listGlobalPatterns,
+  listEscalations,
+  listSecurityIncidents,
+  listProjectCommunications,
+  listMeetingCommunicationsById,
+  listSmsContacts,
+  listGlobalShifts,
+  listConstitutionSuggestions,
+  listInitiatives,
+  listSignals,
+  searchGlobalPatternsByTags,
+  listTracks,
+  listEstimationContextRuns,
+  listRunPhaseMetrics,
+  listShifts,
+  listProjects,
+  listPeople,
+  listConversationEvents,
+  listSubscribers,
+  markSecurityIncidentFalsePositive,
+  markInProgressRunsFailed,
+  markWorkOrderRunsMerged,
+  normalizeEmail,
+  normalizePhone,
+  PEOPLE_IDENTIFIER_TYPES,
+  PEOPLE_PROJECT_RELATIONSHIPS,
+  resolvePeopleByEmails,
+  resolvePersonByIdentifier,
+  setProjectStar,
+  updateProjectAutoShift,
+  updateProjectBuilderEnv,
+  updateProjectBuilderSandboxMode,
+  updateProjectContextFiles,
+  updateProjectMergePolicy,
+  startShift,
+  startGlobalShift,
+  updateInitiative,
+  updateEscalation,
+  updateProjectCommunication,
+  updateProjectLifecycleStatus,
+  updatePerson,
+  updateShift,
+  updateGlobalShift,
+  updateTrack,
+  syncWorkOrderDeps,
+  listAllWorkOrderDeps,
+  getWorkOrderDependents,
+  createTrack,
+  deleteTrack,
+  getTrackById,
+  listBudgetEnforcementLog,
+  upsertSmsContact,
+  PROJECT_MERGE_POLICIES,
+  PROJECT_LIFECYCLE_STATUSES,
+  type CreateGlobalShiftHandoffInput,
+  type CreateShiftHandoffInput,
+  type EscalationStatus,
+  type EscalationType,
+  type InitiativeMilestone,
+  type InitiativePatch,
+  type InitiativeStatus,
+  type ConversationChannel,
+  type ProjectCommunicationIntent,
+  type ProjectCommunicationScope,
+  type ProjectRow,
+  type Track,
+  type ShiftHandoffDecision,
+  type CreateGlobalPatternInput,
+} from "./db.js";
+import { getDiscoveredRepoPaths, syncAndListRepoSummaries } from "./projects_catalog.js";
+import { buildNormalizedSlackPersonIdentifier } from "./slack_identity.js";
+import {
+  cascadeAutoReady,
+  createWorkOrder,
+  getWorkOrder,
+  listWorkOrders,
+  patchWorkOrder,
+  readWorkOrderMarkdown,
+  WorkOrderError,
+  type WorkOrder,
+} from "./work_orders.js";
+import {
+  buildDependencyLookups,
+  buildGlobalWorkOrderLookups,
+  findWorkOrderFromLookups,
+  normalizeDependencyId,
+  parseDependencyRef,
+  resolveWorkOrderDependencies,
+  summarizeResolvedDependencies,
+  type WorkOrderLookup,
+} from "./work_order_dependencies.js";
+import { generateWorkOrderDraft } from "./wo_generation.js";
+import { generateNarration } from "./narration.js";
+import { generateNarrationAudio } from "./narration_tts.js";
+import {
+  applyTrackOrganizationSuggestions,
+  generateTrackOrganizationSuggestions,
+} from "./track_organization.js";
+import {
+  deleteNetworkWhitelistEntry,
+  getAgentMonitoringSettings,
+  getChatSettingsResponse,
+  getRunnerSettingsResponse,
+  getShiftSchedulerSettings,
+  getUtilitySettingsResponse,
+  listNetworkWhitelistEntries,
+  patchAgentMonitoringSettings,
+  patchChatSettings,
+  patchRunnerSettings,
+  patchShiftSchedulerSettings,
+  patchUtilitySettings,
+  upsertNetworkWhitelistEntry,
+} from "./settings.js";
+import {
+  getVoiceAgentDebugSnapshot,
+  getSavedVoiceSettings,
+  parseVoiceAgentSyncPatch,
+  getVoiceSettingsResponse,
+  getVoiceStatus,
+  mergeVoiceSettings,
+  parseVoiceSettingsPatch,
+  requestElevenLabsSignedUrl,
+  resolveElevenLabsCredentials,
+  saveVoiceSettings,
+  syncVoiceAgentConfiguration,
+} from "./voice_settings.js";
+import {
+  getMeetingOutputMediaState,
+  joinMeeting,
+  leaveMeeting,
+  refreshMeetingStatus,
+  startMeetingOutputMedia,
+  stopMeetingOutputMedia,
+} from "./meeting_connector.js";
+import {
+  getMacCalendarUpcoming,
+  getMacContacts,
+  getMacRecentMessages,
+  getMacStatus,
+  sendMacMessage,
+} from "./mac_connector.js";
+import { importLegacyContacts, importMacContacts } from "./contacts_import.js";
+import {
+  cancelCall,
+  confirmCall,
+  listPendingCalls,
+  proposeCall,
+} from "./calling.js";
+import {
+  startConversationBackgroundSync,
+  syncPersonConversations,
+} from "./conversation_sync.js";
+import {
+  buildSlackInstallUrl,
+  exchangeSlackOAuthCode,
+  expireSlackConversations,
+  handleSlackEventEnvelope,
+  sendSlackMessage,
+  verifySlackOAuthState,
+  verifySlackSignature,
+} from "./slack.js";
+import {
+  handleIncomingSms,
+  normalizePhoneNumber,
+  sendSmsMessage,
+  sweepStaleSmsConversations,
+  verifyTwilioSignature,
+} from "./sms.js";
+import {
+  approveGmailDraft,
+  getGmailThreads,
+  sendGmail,
+  syncGmailHistory,
+} from "./gmail_connector.js";
+import {
+  getEscalationDeferral,
+  getExplicitPreferences,
+  getLastEscalationAt,
+  getPreferencePatterns,
+  getUserPreferences,
+  parsePreferencesPatch,
+  updateExplicitPreferences,
+} from "./user_preferences.js";
+import {
+  type ConstitutionInsightCategory,
+  type ConstitutionInsightInput,
+  type ConstitutionInsightScope,
+  listGlobalConstitutionVersions,
+  listProjectConstitutionVersions,
+  mergeConstitutionWithInsights,
+  mergeConstitutions,
+  readGlobalConstitution,
+  readProjectConstitution,
+  writeGlobalConstitution,
+  writeProjectConstitution,
+} from "./constitution.js";
+import {
+  analyzeConstitutionSources,
+  generateConstitutionDraft,
+  generateConstitutionSuggestions,
+  listConstitutionGenerationSources,
+  markConstitutionGenerationComplete,
+} from "./constitution_generation.js";
+import {
+  autoCancelEscalationTimeouts,
+  abortSecurityHoldRun,
+  cancelRun,
+  enqueueCodexRun,
+  finalizeManualRunResolution,
+  getRun,
+  getRunsForProject,
+  approveRunMerge,
+  provideRunInput,
+  rejectRun,
+  resumeRun,
+  resumeSecurityHoldRun,
+} from "./runner_agent.js";
+import {
+  getBudgetSummary,
+  getHeartbeatResponse,
+  listActiveRuns,
+  listObservabilityAlerts,
+  listRunFailureBreakdown,
+  listRunTimeline,
+  tailRunLog,
+} from "./observability.js";
+import { readControlMetadata } from "./sidecar.js";
+import { spawnShiftAgent, tailShiftLog } from "./shift_agent.js";
+import {
+  getShiftSchedulerStatus,
+  notifyShiftSchedulerSettingsUpdated,
+  startShiftScheduler,
+} from "./shift_scheduler.js";
+import {
+  getAutopilotCandidates,
+  getAutopilotSnapshot,
+  parseAutopilotPolicyPatch,
+  startAutopilotScheduler,
+  updateAutopilotPolicyFromPatch,
+} from "./autopilot.js";
+import { buildShiftContext } from "./shift_context.js";
+import { buildGlobalContextResponse } from "./global_context.js";
+import { createProjectFromSpec, type CreateProjectInput } from "./global_agent.js";
+import { listProjectTemplates } from "./project_templates.js";
+import { buildProjectLifecycleSummary } from "./project_lifecycle.js";
+import {
+  buildInitiativeProgress,
+  coerceInitiativePlanInput,
+  generateInitiativePlan,
+  groupPlanSuggestionsByProject,
+  initiativeTag,
+} from "./initiatives.js";
+import type { InitiativePlan, InitiativeProjectSuggestion } from "./initiatives.js";
+import {
+  completeGlobalAgentOnboarding,
+  createGlobalAgentSession,
+  endGlobalAgentSession,
+  getActiveGlobalAgentSession,
+  listGlobalAgentSessionEvents,
+  pauseAutonomousSessionForUserMessage,
+  pauseGlobalAgentSession,
+  recoverAutonomousSessionLoop,
+  startGlobalAgentSessionAutonomous,
+  stopGlobalAgentSession,
+  updateGlobalAgentSessionDetails,
+} from "./global_agent_sessions.js";
+import {
+  getGlobalBudget,
+  getProjectBudget,
+  setGlobalMonthlyBudget,
+  setProjectBudget,
+  transferProjectBudget,
+} from "./budgeting.js";
+import { BudgetEnforcementError, syncProjectBudgetAlerts } from "./budget_enforcement.js";
+import {
+  enqueueChatTurn,
+  enqueueChatTurnForThread,
+  getChatRunDetails,
+  getChatThreadDetails,
+  getChatThreadDetailsById,
+  suggestChatSettings,
+  suggestChatSettingsForThread,
+  PendingSendError,
+} from "./chat_agent.js";
+import { getProjectCostHistory, getProjectCostSummary } from "./cost_tracking.js";
+import { applyChatAction, undoChatAction } from "./chat_actions.js";
+import { listChatAttention, listChatAttentionSummaries } from "./chat_attention.js";
+import { getHealthResponse } from "./health.js";
+import { buildWorktreeDiff, cleanupChatWorktree, resolveChatWorktreeConfig } from "./chat_worktree.js";
+import {
+  createChatThread,
+  getChatThreadById,
+  getChatPendingSendById,
+  listChatActionLedger,
+  listChatThreads,
+  markChatThreadRead,
+  markChatPendingSendCanceled,
+  updateChatThread,
+} from "./chat_db.js";
+import { onChatStreamEvent, type ChatStreamEvent } from "./chat_events.js";
+import {
+  ChatMessageRequestSchema,
+  ChatSuggestRequestSchema,
+  ChatThreadCreateRequestSchema,
+  ChatThreadUpdateRequestSchema,
+} from "./chat_contract.js";
+
+const app = express();
+const port = getServerPort();
+const host = getServerHost();
+const allowLan = getAllowLan();
+const allowRemoteHealth = getAllowRemoteHealth();
+const healthToken = getHealthToken();
+const ESCALATION_TIMEOUT_SWEEP_MS = 10 * 60 * 1000;
+const SLACK_CONVERSATION_SWEEP_MS = 5 * 60 * 1000;
+const SMS_TIMEOUT_SWEEP_MS = 5 * 60 * 1000;
+
+// Initialize the SQLite database on boot to surface path/schema errors early.
+getDb();
+
+function resolveEscalationTimeoutHours(): number {
+  return getEscalationTimeoutHours();
+}
+
+function startEscalationTimeoutSweep(): void {
+  const timeoutHours = resolveEscalationTimeoutHours();
+  const sweep = () => {
+    try {
+      const result = autoCancelEscalationTimeouts(timeoutHours);
+      if (result.canceled > 0) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[escalation] auto-canceled ${result.canceled}/${result.checked} runs after ${timeoutHours}h`
+        );
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        "[escalation] failed to auto-cancel timed-out runs:",
+        err instanceof Error ? err.message : err
+      );
+    }
+  };
+
+  sweep();
+  setInterval(sweep, ESCALATION_TIMEOUT_SWEEP_MS);
+}
+
+function startSlackConversationSweep(): void {
+  const sweep = async () => {
+    try {
+      const expired = await expireSlackConversations({
+        operatorV1Enabled: getSlackOperatorV1Enabled(),
+      });
+      if (expired > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`[slack] auto-ended ${expired} stale conversations`);
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        "[slack] failed to sweep conversations:",
+        err instanceof Error ? err.message : err
+      );
+    }
+  };
+
+  void sweep();
+  setInterval(() => {
+    void sweep();
+  }, SLACK_CONVERSATION_SWEEP_MS);
+}
+
+function startSmsConversationSweep(): void {
+  const sweep = () => {
+    try {
+      const result = sweepStaleSmsConversations();
+      if (result.ended > 0) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[sms] auto-ended ${result.ended}/${result.checked} stale conversations`
+        );
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        "[sms] failed to sweep stale conversations:",
+        err instanceof Error ? err.message : err
+      );
+    }
+  };
+
+  sweep();
+  setInterval(sweep, SMS_TIMEOUT_SWEEP_MS);
+}
+const ESCALATION_TYPES: EscalationType[] = [
+  "need_input",
+  "blocked",
+  "decision_required",
+  "error",
+  "budget_warning",
+  "budget_critical",
+  "budget_exhausted",
+  "run_blocked",
+];
+const ESCALATION_STATUSES: EscalationStatus[] = [
+  "pending",
+  "claimed",
+  "resolved",
+  "escalated_to_user",
+];
+const ESCALATION_TYPE_SET = new Set<EscalationType>(ESCALATION_TYPES);
+const ESCALATION_STATUS_SET = new Set<EscalationStatus>(ESCALATION_STATUSES);
+const ESCALATION_CLAIMANT = "global_agent";
+const NON_URGENT_ESCALATION_TYPES = new Set<EscalationType>([
+  "budget_warning",
+  "decision_required",
+  "need_input",
+  "blocked",
+  "run_blocked",
+]);
+const COMMUNICATION_INTENTS: ProjectCommunicationIntent[] = [
+  "escalation",
+  "request",
+  "message",
+  "suggestion",
+  "status",
+];
+const COMMUNICATION_INTENT_SET = new Set<ProjectCommunicationIntent>(COMMUNICATION_INTENTS);
+const COMMUNICATION_SCOPES: ProjectCommunicationScope[] = ["project", "global", "user"];
+const COMMUNICATION_SCOPE_SET = new Set<ProjectCommunicationScope>(COMMUNICATION_SCOPES);
+const INITIATIVE_STATUSES: InitiativeStatus[] = [
+  "planning",
+  "active",
+  "completed",
+  "at_risk",
+];
+const INITIATIVE_STATUS_SET = new Set<InitiativeStatus>(INITIATIVE_STATUSES);
+const INITIATIVE_MILESTONE_STATUSES: InitiativeMilestone["status"][] = [
+  "pending",
+  "completed",
+  "at_risk",
+];
+const INITIATIVE_MILESTONE_STATUS_SET = new Set<InitiativeMilestone["status"]>(
+  INITIATIVE_MILESTONE_STATUSES
+);
+const COST_PERIODS = ["day", "week", "month", "all_time"] as const;
+const COST_CATEGORIES = ["builder", "reviewer", "chat", "handoff", "other", "all"] as const;
+const COST_PERIOD_SET = new Set<string>(COST_PERIODS);
+const COST_CATEGORY_SET = new Set<string>(COST_CATEGORIES);
+const PEOPLE_IDENTIFIER_TYPE_SET = new Set<string>(PEOPLE_IDENTIFIER_TYPES);
+const PEOPLE_PROJECT_RELATIONSHIP_SET = new Set<string>(PEOPLE_PROJECT_RELATIONSHIPS);
+const CONVERSATION_CHANNEL_SET = new Set<string>(CONVERSATION_CHANNELS);
+const CONVERSATION_SYNC_CHANNEL_SET = new Set<string>(["imessage", "meeting"]);
+const VOICE_SIGNATURE_HEADERS = [
+  "x-elevenlabs-signature",
+  "x-elevenlabs-hmac",
+  "x-webhook-signature",
+  "x-signature",
+];
+
+type RawBodyRequest = express.Request & { rawBody?: Buffer };
+
+function captureRawBody(req: express.Request, _res: Response, buf: Buffer): void {
+  (req as RawBodyRequest).rawBody = buf;
+}
+
+function getSignatureHeader(req: express.Request): string | null {
+  for (const header of VOICE_SIGNATURE_HEADERS) {
+    const value = req.header(header);
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+const SIGNATURE_PREFIXES = new Set(["v1", "sha256"]);
+
+function parseSignatureHeader(value: string): string[] {
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const eqIndex = entry.indexOf("=");
+      if (eqIndex === -1) {
+        return entry;
+      }
+      const key = entry.slice(0, eqIndex).trim().toLowerCase();
+      const rest = entry.slice(eqIndex + 1).trim();
+      if (SIGNATURE_PREFIXES.has(key)) {
+        return rest;
+      }
+      return entry;
+    })
+    .filter(Boolean);
+}
+
+function normalizeSignature(value: string): string {
+  const trimmed = value.trim();
+  if (/^[0-9a-fA-F]+$/.test(trimmed) && trimmed.length % 2 === 0) {
+    return trimmed.toLowerCase();
+  }
+  return trimmed;
+}
+
+function timingSafeEqualString(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+}
+
+function verifyElevenLabsWebhook(
+  req: RawBodyRequest,
+  res: Response,
+  next: NextFunction
+): void {
+  const secret = getElevenLabsWebhookSecret();
+  if (!secret) {
+    res.status(500).json({ error: "voice webhook secret not configured" });
+    return;
+  }
+
+  const signatureHeader = getSignatureHeader(req);
+  if (!signatureHeader) {
+    res.status(401).json({ error: "missing webhook signature" });
+    return;
+  }
+
+  const rawBody = req.rawBody ?? Buffer.from("");
+  const computedHex = normalizeSignature(
+    crypto.createHmac("sha256", secret).update(rawBody).digest("hex")
+  );
+  const computedBase64 = normalizeSignature(
+    crypto.createHmac("sha256", secret).update(rawBody).digest("base64")
+  );
+  const computed = [computedHex, computedBase64];
+  const candidates = parseSignatureHeader(signatureHeader).map(normalizeSignature);
+
+  const ok = candidates.some((candidate) =>
+    computed.some((expected) => timingSafeEqualString(candidate, expected))
+  );
+  if (!ok) {
+    res.status(401).json({ error: "invalid webhook signature" });
+    return;
+  }
+
+  next();
+}
+
+function verifySlackWebhook(
+  req: RawBodyRequest,
+  res: Response,
+  next: NextFunction
+): void {
+  const signature = req.header("x-slack-signature");
+  const timestamp = req.header("x-slack-request-timestamp");
+  const rawBody = req.rawBody ?? Buffer.from("");
+  const result = verifySlackSignature({
+    rawBody,
+    timestamp: timestamp ?? null,
+    signature: signature ?? null,
+  });
+  if (!result.ok) {
+    const status = result.error?.includes("configured") ? 500 : 401;
+    res.status(status).json({ error: result.error ?? "Slack signature invalid" });
+    return;
+  }
+  next();
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function buildTwimlResponse(message: string | null): string {
+  if (!message) return "<Response></Response>";
+  return `<Response><Message>${escapeXml(message)}</Message></Response>`;
+}
+
+function resolveWebhookUrl(req: Request): string {
+  const proto = req.get("x-forwarded-proto")?.trim() || req.protocol;
+  const host =
+    req.get("x-forwarded-host")?.trim() ||
+    req.get("host")?.trim() ||
+    req.hostname;
+  return `${proto}://${host}${req.originalUrl}`;
+}
+
+function isLoopbackHost(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === "127.0.0.1" ||
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    normalized === "0:0:0:0:0:0:0:1"
+  );
+}
+
+function isLoopbackAddress(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "::1" || normalized === "0:0:0:0:0:0:0:1") return true;
+  if (normalized.startsWith("::ffff:")) {
+    const v4 = normalized.slice("::ffff:".length);
+    return v4.startsWith("127.");
+  }
+  return normalized.startsWith("127.");
+}
+
+const HEALTH_PATHS = new Set(["/health", "/heartbeat"]);
+
+function normalizeHealthPath(value: string): string {
+  if (value.length > 1 && value.endsWith("/")) return value.slice(0, -1);
+  return value;
+}
+
+function hasValidHealthToken(req: Request): boolean {
+  if (!healthToken) return true;
+  const queryToken = typeof req.query?.token === "string" ? req.query.token.trim() : "";
+  const headerToken = req.get("x-health-token")?.trim() ?? "";
+  return queryToken === healthToken || headerToken === healthToken;
+}
+
+function cleanupThreadWorktree(thread: {
+  id: string;
+  scope: string;
+  project_id: string | null;
+  worktree_path: string | null;
+}): void {
+  if (thread.scope === "global") return;
+  if (!thread.worktree_path) return;
+  const projectId = thread.project_id;
+  if (!projectId) return;
+  const project = findProjectById(projectId);
+  if (!project) return;
+  const { worktreePath, branchName } = resolveChatWorktreeConfig(
+    thread.id,
+    thread.worktree_path
+  );
+  cleanupChatWorktree({
+    repoPath: project.path,
+    worktreePath,
+    branchName,
+  });
+}
+
+if (!allowLan && !isLoopbackHost(host)) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[security] SHIFTBOSS_HOST=${host} exposes the server beyond loopback. Remote clients are blocked unless SHIFTBOSS_ALLOW_LAN=1.`
+  );
+}
+
+const allowAllCorsRequested = getCorsAllowAllRequested();
+const allowAllCors =
+  allowAllCorsRequested &&
+  !isProductionEnv() &&
+  isLoopbackHost(host);
+if (allowAllCorsRequested && !allowAllCors) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[cors] ignoring SHIFTBOSS_CORS_ALLOW_ALL=1 (NODE_ENV=${getNodeEnvLabel()}, host=${host}); CORS allow-all is dev-only and loopback-only.`
+  );
+}
+
+const defaultDevPorts = [3000, 3010, 3011, 3012, 3013];
+const allowedOrigins = new Set(
+  defaultDevPorts
+    .flatMap((p) => [`http://localhost:${p}`, `http://127.0.0.1:${p}`])
+    .concat(
+      getAllowedOrigins()
+    )
+);
+app.use((req, res, next) => {
+  if (allowLan) return next();
+  const remote = req.socket.remoteAddress;
+  if (isLoopbackAddress(remote)) return next();
+  if (allowRemoteHealth) {
+    const normalizedPath = normalizeHealthPath(req.path);
+    if (HEALTH_PATHS.has(normalizedPath)) {
+      if (!hasValidHealthToken(req)) {
+        return res.status(401).json({
+          error: "unauthorized",
+          message: "Missing or invalid health token.",
+        });
+      }
+      return next();
+    }
+  }
+  return res.status(403).json({
+    error: "forbidden",
+    message:
+      "Shiftboss server is private-by-default and only accepts loopback clients.",
+    hint: "Set SHIFTBOSS_ALLOW_LAN=1 to allow remote clients.",
+  });
+});
+app.use(
+  cors({
+    origin: allowAllCors
+      ? true
+      : (origin, callback) => {
+          if (!origin) return callback(null, true);
+          if (allowedOrigins.has(origin)) return callback(null, true);
+          return callback(null, false);
+        },
+    methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+  })
+);
+app.use(express.json({ verify: captureRawBody }));
+
+app.get("/health", (_req, res) => {
+  res.json(getHealthResponse());
+});
+
+app.get("/heartbeat", (req, res) => {
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit = Number.isFinite(limitRaw)
+    ? Math.max(1, Math.min(100, Math.trunc(limitRaw)))
+    : 20;
+  const heartbeat = getHeartbeatResponse(limit);
+  return res.json({
+    ok: true,
+    status: "ok",
+    mode: getPccMode(),
+    version: getAppVersion(),
+    uptime_seconds: getServerUptimeSeconds(),
+    ...heartbeat,
+  });
+});
+
+app.post("/subscribe", (req, res) => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+  const rawSource = typeof req.body?.source === "string" ? req.body.source.trim() : "";
+  const source = rawSource || "landing";
+  const honeypot =
+    typeof req.body?.company === "string" ? req.body.company.trim() : "";
+  if (honeypot) {
+    return res.json({ status: "success" });
+  }
+  if (!email || !email.includes("@")) {
+    return res.status(400).json({ error: "valid email required" });
+  }
+  try {
+    const result = createSubscriber({ email, source });
+    return res.json({ status: result.status });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "failed to subscribe";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.get("/subscribers", (req, res) => {
+  const limitParam = typeof req.query.limit === "string" ? req.query.limit : null;
+  const parsedLimit = limitParam ? Number.parseInt(limitParam, 10) : NaN;
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : undefined;
+  return res.json({ subscribers: listSubscribers(limit) });
+});
+
+app.get("/api/voice/status", (_req, res) => {
+  return res.json(getVoiceStatus());
+});
+
+app.post("/api/voice/session", async (_req, res) => {
+  try {
+    const { apiKey, agentId } = resolveElevenLabsCredentials();
+    const signedUrl = await requestElevenLabsSignedUrl({ apiKey, agentId });
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ signedUrl });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Failed to mint voice session.";
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post("/api/voice/global-context", verifyElevenLabsWebhook, (_req, res) => {
+  const response = buildGlobalContextResponse();
+  return res.json(response);
+});
+
+app.post("/api/voice/shift-context", verifyElevenLabsWebhook, (req, res) => {
+  const projectId =
+    typeof req.body?.projectId === "string" ? req.body.projectId.trim() : "";
+  if (!projectId) {
+    return res.status(400).json({ error: "`projectId` is required" });
+  }
+  const context = buildShiftContext(projectId);
+  if (!context) return res.status(404).json({ error: "project not found" });
+  syncProjectBudgetAlerts({
+    projectId: context.project.id,
+    projectName: context.project.name,
+    projectPath: context.project.path,
+    readyWorkOrderIds: context.work_orders.ready.map((wo) => wo.id),
+  });
+  return res.json(context);
+});
+
+app.post("/api/voice/work-order", verifyElevenLabsWebhook, (req, res) => {
+  const workOrderId =
+    typeof req.body?.workOrderId === "string" ? req.body.workOrderId.trim() : "";
+  if (!workOrderId) {
+    return res.status(400).json({ error: "`workOrderId` is required" });
+  }
+
+  const projectId =
+    typeof req.body?.projectId === "string" ? req.body.projectId.trim() : "";
+  if (projectId) {
+    const project = findProjectById(projectId);
+    if (!project) return res.status(404).json({ error: "project not found" });
+    try {
+      const workOrder = getWorkOrder(project.path, workOrderId);
+      const markdown = readWorkOrderMarkdown(project.path, workOrderId);
+      return res.json({
+        project: { id: project.id, name: project.name, path: project.path },
+        work_order: workOrder,
+        markdown,
+      });
+    } catch (err) {
+      return sendWorkOrderError(res, err);
+    }
+  }
+
+  const matches: Array<{
+    project: ProjectRow;
+    workOrder: WorkOrder;
+    markdown: string;
+  }> = [];
+  for (const project of listProjects()) {
+    try {
+      const workOrder = getWorkOrder(project.path, workOrderId);
+      const markdown = readWorkOrderMarkdown(project.path, workOrderId);
+      matches.push({ project, workOrder, markdown });
+    } catch (err) {
+      if (err instanceof WorkOrderError && err.code === "not_found") {
+        continue;
+      }
+      return sendWorkOrderError(res, err);
+    }
+  }
+
+  if (!matches.length) {
+    return res.status(404).json({ error: "work order not found" });
+  }
+  if (matches.length > 1) {
+    return res.status(409).json({
+      error: "multiple work orders match; provide projectId",
+      matches: matches.map((match) => ({
+        id: match.project.id,
+        name: match.project.name,
+        path: match.project.path,
+      })),
+    });
+  }
+
+  const match = matches[0];
+  return res.json({
+    project: {
+      id: match.project.id,
+      name: match.project.name,
+      path: match.project.path,
+    },
+    work_order: match.workOrder,
+    markdown: match.markdown,
+  });
+});
+
+app.post("/api/voice/run-status", verifyElevenLabsWebhook, (req, res) => {
+  const runId = typeof req.body?.runId === "string" ? req.body.runId.trim() : "";
+  if (!runId) {
+    return res.status(400).json({ error: "`runId` is required" });
+  }
+  const run = getRun(runId);
+  if (!run) return res.status(404).json({ error: "run not found" });
+  return res.json(run);
+});
+
+app.get("/slack/install", (req, res) => {
+  const result = buildSlackInstallUrl();
+  if (!result.ok || !result.url) {
+    return res.status(500).json({ error: result.error ?? "Slack OAuth not configured" });
+  }
+  if (req.query.redirect === "1") {
+    return res.redirect(result.url);
+  }
+  return res.json({ url: result.url });
+});
+
+app.get("/slack/oauth/callback", async (req, res) => {
+  const state = typeof req.query.state === "string" ? req.query.state.trim() : "";
+  if (!state) return res.status(400).json({ error: "`state` is required" });
+  const stateResult = verifySlackOAuthState(state);
+  if (!stateResult.ok) {
+    return res.status(400).json({ error: stateResult.error ?? "invalid state" });
+  }
+  const slackError = typeof req.query.error === "string" ? req.query.error.trim() : "";
+  if (slackError) return res.status(400).json({ error: slackError });
+  const code = typeof req.query.code === "string" ? req.query.code.trim() : "";
+  if (!code) return res.status(400).json({ error: "`code` is required" });
+  const result = await exchangeSlackOAuthCode(code);
+  if (!result.ok || !result.installation) {
+    return res.status(500).json({ error: result.error ?? "Slack OAuth failed" });
+  }
+  return res.json({
+    installation: {
+      team_id: result.installation.team_id,
+      team_name: result.installation.team_name,
+      bot_user_id: result.installation.bot_user_id,
+    },
+  });
+});
+
+app.post("/slack/events", verifySlackWebhook, async (req, res) => {
+  const result = await handleSlackEventEnvelope(req.body, {
+    operatorV1Enabled: getSlackOperatorV1Enabled(),
+  });
+  return res.status(result.status).json(result.body);
+});
+
+app.post("/slack/messages", async (req, res) => {
+  const body =
+    req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>) : {};
+  const text = typeof body.text === "string" ? body.text.trim() : "";
+  const userId = typeof body.user_id === "string" ? body.user_id.trim() : "";
+  const channelId = typeof body.channel_id === "string" ? body.channel_id.trim() : "";
+  const teamId = typeof body.team_id === "string" ? body.team_id.trim() : "";
+  const threadTs = typeof body.thread_ts === "string" ? body.thread_ts.trim() : "";
+  const projectId = typeof body.project_id === "string" ? body.project_id.trim() : "";
+
+  if (!text) return res.status(400).json({ error: "`text` is required" });
+  if (!userId) return res.status(400).json({ error: "`user_id` is required" });
+
+  const result = await sendSlackMessage({
+    team_id: teamId || null,
+    channel_id: channelId || null,
+    user_id: userId,
+    text,
+    thread_ts: threadTs || null,
+    project_id: projectId || null,
+  });
+
+  if (!result.ok) {
+    return res.status(500).json({ error: result.error ?? "Slack message failed" });
+  }
+  return res.status(201).json({
+    ok: true,
+    slack_ts: result.slack_ts ?? null,
+    conversation_id: result.conversation?.id ?? null,
+  });
+});
+
+app.post(
+  "/api/sms/webhook",
+  express.urlencoded({ extended: false }),
+  async (req, res) => {
+    const record = req.body as Record<string, unknown> | null;
+    const from = typeof record?.From === "string" ? record.From.trim() : "";
+    const to = typeof record?.To === "string" ? record.To.trim() : "";
+    const body = typeof record?.Body === "string" ? record.Body : "";
+    const messageSid =
+      typeof record?.MessageSid === "string" ? record.MessageSid.trim() : null;
+
+    const signatureHeader = req.get("x-twilio-signature")?.trim() ?? null;
+    const url = resolveWebhookUrl(req);
+    const formBody: Record<string, string> = {};
+    if (record) {
+      for (const [key, value] of Object.entries(record)) {
+        if (typeof value === "string") formBody[key] = value;
+      }
+    }
+    if (!verifyTwilioSignature({ signature: signatureHeader, url, body: formBody })) {
+      return res.status(401).send("invalid signature");
+    }
+
+    if (!from || !to) {
+      return res.status(400).send("missing From or To");
+    }
+
+    try {
+      const result = await handleIncomingSms({
+        from,
+        to,
+        body,
+        messageSid,
+      });
+      const twiml = buildTwimlResponse(result.replyMessage);
+      res.setHeader("Content-Type", "text/xml");
+      return res.status(200).send(twiml);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "failed to handle sms";
+      return res.status(400).send(message);
+    }
+  }
+);
+
+app.post("/api/sms/send", async (req, res) => {
+  const to =
+    typeof req.body?.phone_number === "string"
+      ? req.body.phone_number.trim()
+      : typeof req.body?.to === "string"
+        ? req.body.to.trim()
+        : "";
+  const message =
+    typeof req.body?.message === "string"
+      ? req.body.message
+      : typeof req.body?.body === "string"
+        ? req.body.body
+        : "";
+  if (!to || !message) {
+    return res.status(400).json({ error: "`phone_number` and `message` are required" });
+  }
+
+  const result = await sendSmsMessage({
+    phone_number: normalizePhoneNumber(to),
+    body: message,
+    conversation_id:
+      typeof req.body?.conversation_id === "string"
+        ? req.body.conversation_id.trim()
+        : null,
+    project_id:
+      typeof req.body?.project_id === "string" ? req.body.project_id.trim() : null,
+    contact_label:
+      typeof req.body?.contact_label === "string"
+        ? req.body.contact_label.trim()
+        : null,
+    user_id: typeof req.body?.user_id === "string" ? req.body.user_id.trim() : null,
+  });
+
+  if (!result.ok) {
+    const status =
+      result.error === "rate_limit"
+        ? 429
+        : result.error === "budget_exceeded"
+          ? 402
+          : result.error === "twilio_not_configured"
+            ? 503
+            : 400;
+    return res.status(status).json({ error: result.error });
+  }
+
+  return res.json({
+    ok: true,
+    message_sid: result.messageSid,
+    conversation: result.conversation,
+  });
+});
+
+app.get("/api/sms/contacts", (_req, res) => {
+  return res.json({ contacts: listSmsContacts() });
+});
+
+app.post("/api/sms/contacts", (req, res) => {
+  const phoneRaw =
+    typeof req.body?.phone_number === "string"
+      ? req.body.phone_number.trim()
+      : typeof req.body?.phone === "string"
+        ? req.body.phone.trim()
+        : "";
+  const phone = normalizePhoneNumber(phoneRaw);
+  if (!phone) {
+    return res.status(400).json({ error: "`phone_number` is required" });
+  }
+  const label =
+    typeof req.body?.label === "string" ? req.body.label.trim() : undefined;
+  const userId =
+    typeof req.body?.user_id === "string" ? req.body.user_id.trim() : undefined;
+  const projectId =
+    typeof req.body?.project_id === "string"
+      ? req.body.project_id.trim()
+      : undefined;
+  const isPrimary =
+    typeof req.body?.is_primary === "boolean" ? req.body.is_primary : undefined;
+  const contact = upsertSmsContact({
+    phone_number: phone,
+    ...(label !== undefined ? { label } : {}),
+    ...(userId !== undefined ? { user_id: userId } : {}),
+    ...(projectId !== undefined ? { project_id: projectId } : {}),
+    ...(isPrimary !== undefined ? { is_primary: isPrimary } : {}),
+  });
+  return res.status(201).json(contact);
+});
+
+app.post("/meetings/join", async (req, res) => {
+  const result = await joinMeeting(req.body);
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.status(201).json({ meeting: result.meeting });
+});
+
+app.get("/meetings/active", async (_req, res) => {
+  const meeting = await refreshMeetingStatus();
+  return res.json({ meeting });
+});
+
+app.get("/meetings/output-media", async (_req, res) => {
+  const meeting = await refreshMeetingStatus();
+  const outputMedia = getMeetingOutputMediaState();
+  return res.json({ meeting, output_media: outputMedia });
+});
+
+app.post("/meetings/output-media", async (req, res) => {
+  const enabled =
+    typeof req.body?.enabled === "boolean"
+      ? req.body.enabled
+      : typeof req.body?.active === "boolean"
+        ? req.body.active
+        : null;
+  if (enabled === null) {
+    return res.status(400).json({ error: "`enabled` must be a boolean" });
+  }
+
+  const payload = {
+    enabled,
+    mode: typeof req.body?.mode === "string" ? req.body.mode : undefined,
+    project_id:
+      typeof req.body?.project_id === "string" ? req.body.project_id.trim() : undefined,
+    meeting_id:
+      typeof req.body?.meeting_id === "string" ? req.body.meeting_id.trim() : undefined,
+    output_url:
+      typeof req.body?.output_url === "string" ? req.body.output_url.trim() : undefined,
+  };
+
+  const result = enabled
+    ? await startMeetingOutputMedia(payload)
+    : await stopMeetingOutputMedia(payload);
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json({ output_media: result.output_media });
+});
+
+app.post("/meetings/leave", async (_req, res) => {
+  const result = await leaveMeeting();
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json({ meeting: result.meeting });
+});
+
+app.get("/meetings/notes", (req, res) => {
+  const meetingId =
+    typeof req.query.meeting_id === "string" ? req.query.meeting_id.trim() : "";
+  if (!meetingId) {
+    return res.status(400).json({ error: "`meeting_id` is required" });
+  }
+  const projectId =
+    typeof req.query.project_id === "string" ? req.query.project_id.trim() : null;
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.trunc(limitRaw)) : 60;
+  const communications = listMeetingCommunicationsById({
+    meetingId,
+    projectId,
+    limit,
+    order: "desc",
+  });
+  return res.json({ communications });
+});
+
+app.post("/mac/messages/send", async (req, res) => {
+  const result = await sendMacMessage(req.body);
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.status(201).json({ sent: result.data });
+});
+
+app.get("/mac/messages/recent", async (req, res) => {
+  const result = await getMacRecentMessages(req.query);
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json({ messages: result.data });
+});
+
+app.get("/mac/contacts", async (_req, res) => {
+  const result = await getMacContacts();
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json({ contacts: result.data });
+});
+
+app.post("/mac/contacts/import", async (req, res) => {
+  const dryRunValue = req.body?.dry_run ?? req.body?.dryRun;
+  if (dryRunValue !== undefined && typeof dryRunValue !== "boolean") {
+    return res.status(400).json({ error: "`dry_run` must be a boolean" });
+  }
+  const dryRun = dryRunValue ?? false;
+  const result = await importMacContacts({ dryRun });
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json(result.report);
+});
+
+app.post("/mac/contacts/import-legacy", async (req, res) => {
+  const dryRunValue = req.body?.dry_run ?? req.body?.dryRun;
+  if (dryRunValue !== undefined && typeof dryRunValue !== "boolean") {
+    return res.status(400).json({ error: "`dry_run` must be a boolean" });
+  }
+  const dryRun = dryRunValue ?? false;
+  const result = await importLegacyContacts({ dryRun });
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json(result.report);
+});
+
+app.get("/mac/calendar/upcoming", async (req, res) => {
+  const result = await getMacCalendarUpcoming(req.query);
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json({ events: result.data });
+});
+
+app.get("/mac/status", async (_req, res) => {
+  const result = await getMacStatus();
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json({ status: result.data });
+});
+
+app.post("/mac/call", async (req, res) => {
+  const result = await proposeCall(req.body);
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.status(201).json(result.data);
+});
+
+app.get("/mac/call/pending", (_req, res) => {
+  return res.json({ calls: listPendingCalls() });
+});
+
+app.post("/mac/call/confirm/:id", async (req, res) => {
+  const id = req.params.id;
+  if (!id) return res.status(400).json({ error: "`id` is required." });
+  const result = await confirmCall(id);
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json(result.data);
+});
+
+app.post("/mac/call/cancel/:id", (req, res) => {
+  const id = req.params.id;
+  if (!id) return res.status(400).json({ error: "`id` is required." });
+  const result = cancelCall(id);
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json(result.data);
+});
+
+app.get("/gmail/threads", async (req, res) => {
+  const result = await getGmailThreads(req.query);
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json({ threads: result.threads });
+});
+
+app.post("/gmail/send", async (req, res) => {
+  const result = await sendGmail(req.body);
+  if (!result.ok) {
+    return res.status(400).json({ error: result.error });
+  }
+  const status = result.sent ? 201 : 200;
+  return res.status(status).json(result);
+});
+
+app.post("/gmail/send/:draftId/approve", async (req, res) => {
+  const result = await approveGmailDraft(req.params.draftId);
+  if (!result.ok) {
+    return res.status(404).json({ error: result.error });
+  }
+  const status = result.sent ? 201 : 200;
+  return res.status(status).json(result);
+});
+
+app.post("/gmail/sync", async (req, res) => {
+  const result = await syncGmailHistory(req.body);
+  if (!result.ok) {
+    return res.status(result.status).json({ error: result.error });
+  }
+  return res.json({
+    person_id: result.person_id,
+    threads: result.threads,
+    events_added: result.events_added,
+    errors: result.errors,
+  });
+});
+
+app.post("/narration", async (req, res) => {
+  const result = await generateNarration(req.body);
+  if (!result.ok) {
+    return res.status(result.status).json({
+      error: result.error,
+      retry_after_ms: result.retryAfterMs,
+    });
+  }
+  return res.json({
+    text: result.text,
+    provider: result.provider,
+    model: result.model,
+  });
+});
+
+app.post("/narration/speak", async (req, res) => {
+  const result = await generateNarrationAudio(req.body);
+  if (!result.ok) {
+    return res.status(result.status).json({
+      error: result.error,
+      retry_after_ms: result.retryAfterMs,
+    });
+  }
+  res.setHeader("Content-Type", result.contentType);
+  res.setHeader("Cache-Control", "no-store");
+  return res.send(result.audio);
+});
+
+app.get("/observability/runs/active", (req, res) => {
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit = Number.isFinite(limitRaw)
+    ? Math.max(1, Math.min(100, Math.trunc(limitRaw)))
+    : 20;
+  return res.json(listActiveRuns(limit));
+});
+
+app.get("/observability/runs/timeline", (req, res) => {
+  const hoursRaw = typeof req.query.hours === "string" ? Number(req.query.hours) : NaN;
+  const hours = Number.isFinite(hoursRaw) ? Math.trunc(hoursRaw) : 24;
+  return res.json(listRunTimeline(hours));
+});
+
+app.get("/observability/runs/failure-breakdown", (req, res) => {
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit = Number.isFinite(limitRaw)
+    ? Math.max(10, Math.min(1000, Math.trunc(limitRaw)))
+    : 200;
+  const projectId = typeof req.query.projectId === "string" ? req.query.projectId : null;
+  if (projectId && !findProjectById(projectId)) {
+    return res.status(404).json({ error: "project not found" });
+  }
+  return res.json(listRunFailureBreakdown(limit, projectId));
+});
+
+app.get("/observability/budget/summary", (_req, res) => {
+  return res.json(getBudgetSummary());
+});
+
+app.get("/observability/alerts", async (req, res) => {
+  const projectId = typeof req.query.projectId === "string" ? req.query.projectId : null;
+  if (projectId && !findProjectById(projectId)) {
+    return res.status(404).json({ error: "project not found" });
+  }
+  try {
+    const alerts = await listObservabilityAlerts(projectId);
+    return res.json(alerts);
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "failed to fetch alerts",
+    });
+  }
+});
+
+app.get("/security-incidents", (req, res) => {
+  const start = typeof req.query.start === "string" ? req.query.start.trim() : "";
+  const end = typeof req.query.end === "string" ? req.query.end.trim() : "";
+  if (start && Number.isNaN(Date.parse(start))) {
+    return res.status(400).json({ error: "invalid start date" });
+  }
+  if (end && Number.isNaN(Date.parse(end))) {
+    return res.status(400).json({ error: "invalid end date" });
+  }
+
+  const verdictRaw = typeof req.query.verdict === "string" ? req.query.verdict.trim() : "";
+  const verdict = verdictRaw ? verdictRaw.toUpperCase() : "";
+  if (verdict && !["SAFE", "WARN", "KILL"].includes(verdict)) {
+    return res.status(400).json({ error: "invalid verdict filter" });
+  }
+
+  let falsePositive: boolean | undefined;
+  if (typeof req.query.false_positive === "string") {
+    const raw = req.query.false_positive.trim().toLowerCase();
+    if (raw === "true" || raw === "1") falsePositive = true;
+    else if (raw === "false" || raw === "0") falsePositive = false;
+    else return res.status(400).json({ error: "invalid false_positive filter" });
+  }
+
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit = Number.isFinite(limitRaw)
+    ? Math.max(1, Math.min(500, Math.trunc(limitRaw)))
+    : 200;
+
+  return res.json(
+    listSecurityIncidents({
+      start: start || undefined,
+      end: end || undefined,
+      verdict: verdict ? (verdict as "SAFE" | "WARN" | "KILL") : undefined,
+      false_positive: falsePositive,
+      limit,
+      order: "desc",
+    })
+  );
+});
+
+app.get("/security-incidents/stats", (_req, res) => {
+  return res.json(getIncidentStats());
+});
+
+app.patch("/security-incidents/:id", (req, res) => {
+  const body = req.body as Record<string, unknown> | null;
+  if (!body || typeof body !== "object") {
+    return res.status(400).json({ error: "request body required" });
+  }
+  let falsePositive: boolean | null = null;
+  if ("false_positive" in body) {
+    const raw = body.false_positive;
+    if (typeof raw === "boolean") falsePositive = raw;
+    else if (raw === 0 || raw === 1) falsePositive = raw === 1;
+  }
+  if (falsePositive === null) {
+    return res.status(400).json({ error: "`false_positive` must be boolean" });
+  }
+  const resolutionNotes =
+    typeof body.resolution_notes === "string" ? body.resolution_notes.trim() : undefined;
+  const updated = markSecurityIncidentFalsePositive({
+    id: req.params.id,
+    false_positive: falsePositive,
+    resolution_notes: resolutionNotes,
+  });
+  if (!updated) return res.status(404).json({ error: "incident not found" });
+  return res.json(updated);
+});
+
+app.get("/settings", (_req, res) => {
+  return res.json(getRunnerSettingsResponse());
+});
+
+app.patch("/settings", (req, res) => {
+  try {
+    const updated = patchRunnerSettings(req.body ?? {});
+    return res.json(updated);
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "invalid settings",
+    });
+  }
+});
+
+app.get("/settings/agent-monitoring", (_req, res) => {
+  return res.json({ settings: getAgentMonitoringSettings() });
+});
+
+app.patch("/settings/agent-monitoring", (req, res) => {
+  try {
+    const settings = patchAgentMonitoringSettings(req.body ?? {});
+    return res.json({ settings });
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "invalid agent monitoring settings",
+    });
+  }
+});
+
+app.get("/settings/shift-scheduler", (_req, res) => {
+  return res.json({
+    settings: getShiftSchedulerSettings(),
+    status: getShiftSchedulerStatus(),
+  });
+});
+
+app.patch("/settings/shift-scheduler", (req, res) => {
+  try {
+    const settings = patchShiftSchedulerSettings(req.body ?? {});
+    notifyShiftSchedulerSettingsUpdated(settings);
+    return res.json({ settings, status: getShiftSchedulerStatus() });
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "invalid shift scheduler settings",
+    });
+  }
+});
+
+app.get("/settings/utility", (_req, res) => {
+  return res.json(getUtilitySettingsResponse());
+});
+
+app.patch("/settings/utility", (req, res) => {
+  try {
+    const updated = patchUtilitySettings(req.body ?? {});
+    return res.json(updated);
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "invalid utility settings",
+    });
+  }
+});
+
+app.get("/settings/voice", (_req, res) => {
+  return res.json(getVoiceSettingsResponse());
+});
+
+app.patch("/settings/voice", async (req, res) => {
+  try {
+    const patch = parseVoiceSettingsPatch(req.body ?? {});
+    const saved = getSavedVoiceSettings();
+    const merged = mergeVoiceSettings(saved, patch);
+    const hasUpdate = patch.apiKey !== undefined || patch.agentId !== undefined;
+    if (hasUpdate && merged.apiKey && merged.agentId) {
+      await requestElevenLabsSignedUrl({
+        apiKey: merged.apiKey,
+        agentId: merged.agentId,
+      });
+    }
+    if (hasUpdate) {
+      saveVoiceSettings(merged);
+    }
+    return res.json(getVoiceSettingsResponse());
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "invalid voice settings",
+    });
+  }
+});
+
+app.get("/settings/voice/agent/debug", async (_req, res) => {
+  try {
+    const snapshot = await getVoiceAgentDebugSnapshot();
+    return res.json(snapshot);
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "failed to load voice agent debug snapshot",
+    });
+  }
+});
+
+app.post("/settings/voice/agent/sync", async (req, res) => {
+  try {
+    const patch = parseVoiceAgentSyncPatch(req.body ?? {});
+    const result = await syncVoiceAgentConfiguration(patch);
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "failed to sync voice agent configuration",
+    });
+  }
+});
+
+app.get("/settings/network-whitelist", (_req, res) => {
+  return res.json({ entries: listNetworkWhitelistEntries() });
+});
+
+app.post("/settings/network-whitelist", (req, res) => {
+  try {
+    const entry = upsertNetworkWhitelistEntry(req.body ?? {});
+    return res.json({ entry });
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "invalid whitelist entry",
+    });
+  }
+});
+
+app.delete("/settings/network-whitelist", (req, res) => {
+  try {
+    const domain =
+      (typeof req.body?.domain === "string" ? req.body.domain : null) ??
+      (typeof req.query.domain === "string" ? req.query.domain : "");
+    if (!domain.trim()) {
+      return res.status(400).json({ error: "domain is required" });
+    }
+    const deleted = deleteNetworkWhitelistEntry(domain);
+    if (!deleted) {
+      return res.status(404).json({ error: "domain not found" });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "invalid whitelist entry",
+    });
+  }
+});
+
+app.get("/chat/settings", (_req, res) => {
+  return res.json(getChatSettingsResponse());
+});
+
+app.patch("/chat/settings", (req, res) => {
+  try {
+    const updated = patchChatSettings(req.body ?? {});
+    return res.json(updated);
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "invalid settings",
+    });
+  }
+});
+
+app.get("/constitution", (req, res) => {
+  const projectId = typeof req.query.projectId === "string" ? req.query.projectId : null;
+  const global = readGlobalConstitution();
+  let local: string | null = null;
+
+  if (projectId) {
+    const project = findProjectById(projectId);
+    if (!project) return res.status(404).json({ error: "project not found" });
+    local = readProjectConstitution(project.path);
+  }
+
+  const merged = mergeConstitutions(global, local);
+  return res.json({ global, local, merged });
+});
+
+app.put("/constitution/global", (req, res) => {
+  const content = req.body?.content;
+  const statementsRaw = req.body?.statements;
+  const source =
+    typeof req.body?.source === "string" && req.body.source.trim()
+      ? req.body.source.trim()
+      : undefined;
+  if (typeof content !== "string" && !Array.isArray(statementsRaw)) {
+    return res.status(400).json({ error: "`content` must be string" });
+  }
+  if (Array.isArray(statementsRaw)) {
+    const invalid = statementsRaw.some((entry: unknown) => typeof entry !== "string");
+    if (invalid) {
+      return res.status(400).json({ error: "`statements` must be string array" });
+    }
+  }
+  const result = writeGlobalConstitution(typeof content === "string" ? content : "", {
+    statements: Array.isArray(statementsRaw) ? statementsRaw : undefined,
+    source,
+  });
+  return res.json({ ok: true, version: result.version });
+});
+
+app.get("/constitution/versions", (req, res) => {
+  const scope = typeof req.query.scope === "string" ? req.query.scope : null;
+  if (scope !== "global" && scope !== "project") {
+    return res.status(400).json({ error: "`scope` must be global or project" });
+  }
+  if (scope === "global") {
+    return res.json({ versions: listGlobalConstitutionVersions() });
+  }
+
+  const projectId = typeof req.query.projectId === "string" ? req.query.projectId : null;
+  if (!projectId) {
+    return res.status(400).json({ error: "`projectId` required for project scope" });
+  }
+  const project = findProjectById(projectId);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  return res.json({ versions: listProjectConstitutionVersions(project.path) });
+});
+
+const INSIGHT_CATEGORY_SET = new Set([
+  "decision",
+  "style",
+  "anti",
+  "success",
+  "communication",
+]);
+const INSIGHT_SCOPE_SET = new Set<ConstitutionInsightScope>(["global", "project"]);
+
+function isInsightCategory(value: string): value is ConstitutionInsightCategory {
+  return INSIGHT_CATEGORY_SET.has(value);
+}
+
+function isInsightScope(value: string): value is ConstitutionInsightScope {
+  return INSIGHT_SCOPE_SET.has(value as ConstitutionInsightScope);
+}
+
+app.post("/constitution/generation/sources", (req, res) => {
+  try {
+    const projectId = typeof req.body?.projectId === "string" ? req.body.projectId : null;
+    const range =
+      req.body?.range && typeof req.body.range === "object" ? req.body.range : null;
+    const result = listConstitutionGenerationSources({ projectId, range });
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "failed to load sources",
+    });
+  }
+});
+
+app.post("/constitution/generation/analyze", async (req, res) => {
+  try {
+    const projectId = typeof req.body?.projectId === "string" ? req.body.projectId : null;
+    const range =
+      req.body?.range && typeof req.body.range === "object" ? req.body.range : null;
+    const maxConversations =
+      typeof req.body?.maxConversations === "number" ? req.body.maxConversations : undefined;
+    const result = await analyzeConstitutionSources({
+      projectId,
+      range,
+      maxConversations,
+      sources: req.body?.sources ?? {},
+    });
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "analysis failed",
+    });
+  }
+});
+
+app.post("/constitution/generation/draft", async (req, res) => {
+  try {
+    const projectId = typeof req.body?.projectId === "string" ? req.body.projectId : null;
+    const baseGlobal =
+      typeof req.body?.baseGlobal === "string" ? req.body.baseGlobal : null;
+    const baseProject =
+      typeof req.body?.baseProject === "string" ? req.body.baseProject : null;
+    const baseLegacy = typeof req.body?.base === "string" ? req.body.base : null;
+    const insightsRaw: unknown[] = Array.isArray(req.body?.insights) ? req.body.insights : [];
+    const insights: ConstitutionInsightInput[] = insightsRaw
+      .map((entry): ConstitutionInsightInput | null => {
+        if (!entry || typeof entry !== "object") return null;
+        const record = entry as Record<string, unknown>;
+        const category = typeof record.category === "string" ? record.category : "";
+        const text = typeof record.text === "string" ? record.text : "";
+        const scopeRaw = typeof record.scope === "string" ? record.scope : "";
+        const scope = isInsightScope(scopeRaw) ? scopeRaw : undefined;
+        if (!isInsightCategory(category) || !text.trim()) return null;
+        return { category, text: text.trim(), scope };
+      })
+      .filter((entry): entry is ConstitutionInsightInput => Boolean(entry));
+    const warnings: string[] = [];
+    const globalInsights: ConstitutionInsightInput[] = [];
+    const projectInsights: ConstitutionInsightInput[] = [];
+    const defaultScope: ConstitutionInsightScope = projectId ? "project" : "global";
+    let defaultedScopes = 0;
+    let ignoredProject = 0;
+
+    for (const insight of insights) {
+      const scope = insight.scope ?? defaultScope;
+      if (!insight.scope) defaultedScopes += 1;
+      if (scope === "project" && !projectId) {
+        ignoredProject += 1;
+        continue;
+      }
+      if (scope === "global") {
+        globalInsights.push(insight);
+      } else {
+        projectInsights.push(insight);
+      }
+    }
+
+    if (defaultedScopes > 0 && projectId) {
+      warnings.push("Some insights were missing scope and defaulted to project.");
+    }
+    if (ignoredProject > 0) {
+      warnings.push("Project-scoped insights were ignored because no project is selected.");
+    }
+
+    const globalDraft = await generateConstitutionDraft({
+      projectId: null,
+      insights: globalInsights,
+      base: baseGlobal ?? (!projectId ? baseLegacy : null),
+    });
+    const projectDraft = projectId
+      ? await generateConstitutionDraft({
+          projectId,
+          insights: projectInsights,
+          base: baseProject ?? baseLegacy,
+        })
+      : null;
+    return res.json({ drafts: { global: globalDraft, project: projectDraft }, warnings });
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "draft generation failed",
+    });
+  }
+});
+
+app.post("/constitution/generation/complete", (req, res) => {
+  try {
+    const projectId = typeof req.body?.projectId === "string" ? req.body.projectId : null;
+    const lastGeneratedAt =
+      typeof req.body?.lastGeneratedAt === "string" ? req.body.lastGeneratedAt : null;
+    const result = markConstitutionGenerationComplete({ projectId, lastGeneratedAt });
+    return res.json({ ok: true, meta: result });
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "failed to update generation metadata",
+    });
+  }
+});
+
+app.get("/repos", (_req, res) => {
+  return res.json(syncAndListRepoSummaries());
+});
+
+type SuccessMetric = {
+  name: string;
+  target: number | string;
+  current?: number | string | null;
+};
+
+function isSuccessMetric(value: unknown): value is SuccessMetric {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (typeof record.name !== "string" || !record.name.trim()) return false;
+  if (!(typeof record.target === "number" || typeof record.target === "string")) return false;
+  if ("current" in record) {
+    if (
+      !(
+        record.current === null ||
+        record.current === undefined ||
+        typeof record.current === "number" ||
+        typeof record.current === "string"
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function safeParseSuccessMetrics(value: string | null | undefined): SuccessMetric[] {
+  if (typeof value !== "string" || value.length === 0) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isSuccessMetric);
+  } catch {
+    return [];
+  }
+}
+
+app.get("/repos/:id", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const meta = readControlMetadata(project.path);
+  const successCriteria = meta?.success_criteria ?? project.success_criteria;
+  const successMetrics =
+    meta?.success_metrics ?? safeParseSuccessMetrics(project.success_metrics);
+  const parsedBuilderEnv = (() => {
+    try { return JSON.parse(project.builder_env ?? "null"); }
+    catch { return null; }
+  })();
+  return res.json({
+    project: {
+      id: project.id,
+      name: project.name,
+      success_criteria: successCriteria,
+      success_metrics: successMetrics,
+      auto_shift_enabled: project.auto_shift_enabled === 1,
+      merge_policy: project.merge_policy,
+      builder_sandbox_mode: project.builder_sandbox_mode,
+      builder_env: parsedBuilderEnv,
+    },
+  });
+});
+
+app.patch("/repos/:id", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const body = req.body as Record<string, unknown> | null;
+  if (!body || typeof body !== "object") {
+    return res.status(400).json({ error: "request body required" });
+  }
+
+  let updated = project;
+  let hasValidField = false;
+  if ("merge_policy" in body) {
+    const mergePolicy = typeof body.merge_policy === "string" ? body.merge_policy : null;
+    if (!mergePolicy || !PROJECT_MERGE_POLICIES.includes(mergePolicy as (typeof PROJECT_MERGE_POLICIES)[number])) {
+      return res.status(400).json({
+        error: "`merge_policy` must be auto_merge, human_approve, or pull_request",
+      });
+    }
+    const next = updateProjectMergePolicy(
+      id,
+      mergePolicy as (typeof PROJECT_MERGE_POLICIES)[number]
+    );
+    if (!next) return res.status(500).json({ error: "failed to update project" });
+    updated = next;
+    hasValidField = true;
+  }
+
+  if ("context_files" in body) {
+    const raw = body.context_files;
+    if (raw !== null && !Array.isArray(raw)) {
+      return res.status(400).json({ error: "`context_files` must be an array or null" });
+    }
+    let serialized: string | null = null;
+    if (Array.isArray(raw)) {
+      for (const entry of raw) {
+        if (
+          typeof entry !== "object" || entry === null ||
+          typeof (entry as Record<string, unknown>).source !== "string" ||
+          typeof (entry as Record<string, unknown>).dest !== "string"
+        ) {
+          return res.status(400).json({
+            error: "each `context_files` entry must have `source` and `dest` strings",
+          });
+        }
+      }
+      serialized = JSON.stringify(raw);
+    }
+    const next = updateProjectContextFiles(id, serialized);
+    if (!next) return res.status(500).json({ error: "failed to update project" });
+    updated = next;
+    hasValidField = true;
+  }
+
+  if ("builder_sandbox_mode" in body) {
+    const raw = body.builder_sandbox_mode;
+    const VALID_SANDBOX_MODES = new Set([
+      "read-only", "workspace-write", "workspace-write-whitelist", "danger-full-access",
+    ]);
+    if (raw !== null && (typeof raw !== "string" || !VALID_SANDBOX_MODES.has(raw))) {
+      return res.status(400).json({
+        error: "`builder_sandbox_mode` must be read-only, workspace-write, workspace-write-whitelist, danger-full-access, or null",
+      });
+    }
+    const next = updateProjectBuilderSandboxMode(id, raw as string | null);
+    if (!next) return res.status(500).json({ error: "failed to update project" });
+    updated = next;
+    hasValidField = true;
+  }
+
+  if ("builder_env" in body) {
+    const raw = body.builder_env;
+    if (raw !== null && (typeof raw !== "object" || Array.isArray(raw))) {
+      return res.status(400).json({ error: "`builder_env` must be an object or null" });
+    }
+    let serialized: string | null = null;
+    if (raw !== null) {
+      const entries = Object.entries(raw as Record<string, unknown>);
+      for (const [key, value] of entries) {
+        if (typeof key !== "string" || typeof value !== "string") {
+          return res.status(400).json({
+            error: "`builder_env` keys and values must all be strings",
+          });
+        }
+      }
+      const BLOCKED_ENV_KEYS = new Set([
+        "PATH", "HOME", "USER", "SHELL", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES",
+      ]);
+      const blocked = entries.find(([k]) => BLOCKED_ENV_KEYS.has(k));
+      if (blocked) {
+        return res.status(400).json({
+          error: `\`builder_env\` key "${blocked[0]}" is not allowed`,
+        });
+      }
+      serialized = JSON.stringify(raw);
+    }
+    const next = updateProjectBuilderEnv(id, serialized);
+    if (!next) return res.status(500).json({ error: "failed to update project" });
+    updated = next;
+    hasValidField = true;
+  }
+
+  if (!hasValidField) {
+    return res.status(400).json({ error: "no valid fields to update" });
+  }
+
+  const meta = readControlMetadata(updated.path);
+  const successCriteria = meta?.success_criteria ?? updated.success_criteria;
+  const successMetrics =
+    meta?.success_metrics ?? safeParseSuccessMetrics(updated.success_metrics);
+  const parsedContextFiles = (() => {
+    try { return JSON.parse(updated.context_files ?? "null"); }
+    catch { return null; }
+  })();
+  const parsedBuilderEnv = (() => {
+    try { return JSON.parse(updated.builder_env ?? "null"); }
+    catch { return null; }
+  })();
+  return res.json({
+    project: {
+      id: updated.id,
+      name: updated.name,
+      success_criteria: successCriteria,
+      success_metrics: successMetrics,
+      auto_shift_enabled: updated.auto_shift_enabled === 1,
+      merge_policy: updated.merge_policy,
+      context_files: parsedContextFiles,
+      builder_sandbox_mode: updated.builder_sandbox_mode,
+      builder_env: parsedBuilderEnv,
+    },
+  });
+});
+
+app.get("/projects/:id/costs", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const periodParam = typeof req.query.period === "string" ? req.query.period : null;
+  const categoryParam = typeof req.query.category === "string" ? req.query.category : null;
+  const period = periodParam ?? "month";
+  const category = categoryParam ?? "all";
+
+  if (!COST_PERIOD_SET.has(period)) {
+    return res.status(400).json({ error: "`period` must be day, week, month, or all_time" });
+  }
+  if (!COST_CATEGORY_SET.has(category)) {
+    return res.status(400).json({
+      error: "`category` must be builder, reviewer, chat, handoff, other, or all",
+    });
+  }
+
+  const summary = getProjectCostSummary({
+    projectId: project.id,
+    period: period as "day" | "week" | "month" | "all_time",
+    category: category as "all" | "builder" | "reviewer" | "chat" | "handoff" | "other",
+  });
+  return res.json(summary);
+});
+
+app.get("/projects/:id/costs/history", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const daysRaw = typeof req.query.days === "string" ? Number(req.query.days) : NaN;
+  const days = Number.isFinite(daysRaw) ? Math.trunc(daysRaw) : 30;
+  if (days <= 0) {
+    return res.status(400).json({ error: "`days` must be a positive number" });
+  }
+
+  return res.json(getProjectCostHistory(project.id, days));
+});
+
+app.get("/budget", (_req, res) => {
+  return res.json(getGlobalBudget());
+});
+
+app.put("/budget", (req, res) => {
+  const value = req.body?.monthly_budget_usd;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return res.status(400).json({ error: "`monthly_budget_usd` must be a non-negative number" });
+  }
+  return res.json(setGlobalMonthlyBudget(value));
+});
+
+app.get("/projects/:id/budget", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const budget = getProjectBudget(project.id);
+  syncProjectBudgetAlerts({
+    projectId: project.id,
+    projectName: project.name,
+    projectPath: project.path,
+    projectBudget: budget,
+  });
+  return res.json(budget);
+});
+
+app.put("/projects/:id/budget", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const value = req.body?.monthly_allocation_usd;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return res.status(400).json({ error: "`monthly_allocation_usd` must be a non-negative number" });
+  }
+  return res.json(setProjectBudget(project.id, value));
+});
+
+app.post("/projects/:id/budget/transfer", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const toProjectId =
+    typeof req.body?.to_project_id === "string" ? req.body.to_project_id.trim() : "";
+  const amount = req.body?.amount_usd;
+
+  if (!toProjectId) {
+    return res.status(400).json({ error: "`to_project_id` must be provided" });
+  }
+  if (toProjectId === project.id) {
+    return res.status(400).json({ error: "cannot transfer to the same project" });
+  }
+  if (typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: "`amount_usd` must be a positive number" });
+  }
+  const targetProject = findProjectById(toProjectId);
+  if (!targetProject) return res.status(404).json({ error: "target project not found" });
+
+  try {
+    const result = transferProjectBudget({
+      fromProjectId: project.id,
+      toProjectId: targetProject.id,
+      amountUsd: amount,
+    });
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "failed to transfer budget",
+    });
+  }
+});
+
+app.get("/projects/:id/budget/enforcement", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.trunc(limitRaw)) : 50;
+  const events = listBudgetEnforcementLog(project.id, limit);
+  return res.json({ events });
+});
+
+function parsePersonTagsInput(
+  value: unknown
+): { ok: true; tags: string[] } | { ok: false; error: string } {
+  if (value === null) return { ok: true, tags: [] };
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return { ok: true, tags: trimmed ? [trimmed] : [] };
+  }
+  if (Array.isArray(value)) {
+    const tags: string[] = [];
+    for (const entry of value) {
+      if (typeof entry !== "string") {
+        return { ok: false, error: "`tags` must be an array of strings" };
+      }
+      const trimmed = entry.trim();
+      if (trimmed) tags.push(trimmed);
+    }
+    return { ok: true, tags };
+  }
+  return { ok: false, error: "`tags` must be a string or array of strings" };
+}
+
+app.get("/people/resolve", (req, res) => {
+  if (req.query.phone !== undefined && typeof req.query.phone !== "string") {
+    return res.status(400).json({ error: "`phone` must be a string" });
+  }
+  if (req.query.email !== undefined && typeof req.query.email !== "string") {
+    return res.status(400).json({ error: "`email` must be a string" });
+  }
+
+  const phone = typeof req.query.phone === "string" ? req.query.phone.trim() : "";
+  const email = typeof req.query.email === "string" ? req.query.email.trim() : "";
+
+  if (phone && email) {
+    return res.status(400).json({ error: "provide only one of `phone` or `email`" });
+  }
+  if (!phone && !email) {
+    return res.status(400).json({ error: "`phone` or `email` is required" });
+  }
+
+  if (phone) {
+    const normalized = normalizePhone(phone);
+    if (!normalized) return res.status(400).json({ error: "invalid phone" });
+    const person = resolvePersonByIdentifier({
+      type: "phone",
+      normalizedValue: normalized,
+    });
+    if (!person) return res.status(404).json({ error: "person not found" });
+    return res.json({ person });
+  }
+
+  const normalized = normalizeEmail(email);
+  if (!normalized) return res.status(400).json({ error: "invalid email" });
+  const person = resolvePersonByIdentifier({
+    type: "email",
+    normalizedValue: normalized,
+  });
+  if (!person) return res.status(404).json({ error: "person not found" });
+  return res.json({ person });
+});
+
+app.get("/people/resolve/slack", (req, res) => {
+  if (req.query.team_id !== undefined && typeof req.query.team_id !== "string") {
+    return res.status(400).json({ error: "`team_id` must be a string" });
+  }
+  if (req.query.user_id !== undefined && typeof req.query.user_id !== "string") {
+    return res.status(400).json({ error: "`user_id` must be a string" });
+  }
+
+  const teamId = typeof req.query.team_id === "string" ? req.query.team_id.trim() : "";
+  const userId = typeof req.query.user_id === "string" ? req.query.user_id.trim() : "";
+  if (!teamId || !userId) {
+    return res.status(400).json({ error: "`team_id` and `user_id` are required" });
+  }
+
+  const normalizedValue = buildNormalizedSlackPersonIdentifier({ teamId, userId });
+  if (!normalizedValue) {
+    return res.status(400).json({ error: "invalid Slack identity" });
+  }
+
+  const person = resolvePersonByIdentifier({
+    type: "other",
+    normalizedValue,
+  });
+  if (!person) return res.status(404).json({ error: "person not found" });
+  return res.json({ person });
+});
+
+app.post("/people/resolve", (req, res) => {
+  const rawEmails = req.body?.emails ?? req.body?.attendees ?? req.body?.attendee_emails;
+  if (!Array.isArray(rawEmails)) {
+    return res.status(400).json({ error: "`emails` must be an array of strings" });
+  }
+  const emails = rawEmails
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean);
+  if (!emails.length) {
+    return res.status(400).json({ error: "`emails` must include at least one email" });
+  }
+  const projectId =
+    typeof req.body?.project_id === "string" ? req.body.project_id.trim() : "";
+  const matches = resolvePeopleByEmails(
+    emails,
+    projectId ? { projectId } : {}
+  );
+  const matchesByEmail = new Map(matches.map((match) => [match.email, match]));
+  const participants = emails.map((email) => {
+    const normalized = normalizeEmail(email);
+    if (!normalized) return { email, person: null };
+    const match = matchesByEmail.get(normalized);
+    if (!match) return { email: normalized, person: null };
+    return {
+      email: normalized,
+      person: {
+        id: match.person_id,
+        name: match.name,
+        role: match.role ?? null,
+        company: match.company ?? null,
+        relationship: match.relationship ?? null,
+      },
+    };
+  });
+  return res.json({ participants });
+});
+
+app.get("/people", (req, res) => {
+  if (req.query.q !== undefined && typeof req.query.q !== "string") {
+    return res.status(400).json({ error: "`q` must be a string" });
+  }
+  if (req.query.project !== undefined && typeof req.query.project !== "string") {
+    return res.status(400).json({ error: "`project` must be a string" });
+  }
+  if (req.query.tag !== undefined && typeof req.query.tag !== "string") {
+    return res.status(400).json({ error: "`tag` must be a string" });
+  }
+  if (req.query.starred !== undefined && typeof req.query.starred !== "string") {
+    return res.status(400).json({ error: "`starred` must be a string" });
+  }
+
+  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  const projectId = typeof req.query.project === "string" ? req.query.project.trim() : "";
+  const tag = typeof req.query.tag === "string" ? req.query.tag.trim() : "";
+  const starredRaw = typeof req.query.starred === "string" ? req.query.starred.trim() : "";
+  let starred: 0 | 1 | null = null;
+
+  if (starredRaw) {
+    const normalized = starredRaw.toLowerCase();
+    if (normalized === "1" || normalized === "true") {
+      starred = 1;
+    } else if (normalized === "0" || normalized === "false") {
+      starred = 0;
+    } else {
+      return res.status(400).json({ error: "`starred` must be true or false" });
+    }
+  }
+
+  const people = listPeople({
+    q: q || null,
+    projectId: projectId || null,
+    tag: tag || null,
+    starred,
+  });
+  return res.json({ people });
+});
+
+app.get("/people/:id", (req, res) => {
+  const { id } = req.params;
+  const person = getPersonDetails(id);
+  if (!person) return res.status(404).json({ error: "person not found" });
+  return res.json({ person });
+});
+
+app.post("/people", (req, res) => {
+  const payload = req.body ?? {};
+  const nameValue = payload.name;
+  if (typeof nameValue !== "string" || !nameValue.trim()) {
+    return res.status(400).json({ error: "`name` is required" });
+  }
+
+  const nicknameValue = payload.nickname;
+  if (
+    nicknameValue !== undefined &&
+    nicknameValue !== null &&
+    typeof nicknameValue !== "string"
+  ) {
+    return res.status(400).json({ error: "`nickname` must be a string" });
+  }
+
+  const companyValue = payload.company;
+  if (
+    companyValue !== undefined &&
+    companyValue !== null &&
+    typeof companyValue !== "string"
+  ) {
+    return res.status(400).json({ error: "`company` must be a string" });
+  }
+
+  const roleValue = payload.role;
+  if (roleValue !== undefined && roleValue !== null && typeof roleValue !== "string") {
+    return res.status(400).json({ error: "`role` must be a string" });
+  }
+
+  const notesValue = payload.notes;
+  if (notesValue !== undefined && notesValue !== null && typeof notesValue !== "string") {
+    return res.status(400).json({ error: "`notes` must be a string" });
+  }
+
+  let tags: string[] | undefined;
+  if ("tags" in payload) {
+    const parsed = parsePersonTagsInput(payload.tags);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    tags = parsed.tags;
+  }
+
+  if ("starred" in payload && typeof payload.starred !== "boolean") {
+    return res.status(400).json({ error: "`starred` must be boolean" });
+  }
+
+  const person = createPerson({
+    name: nameValue.trim(),
+    nickname: typeof nicknameValue === "string" ? normalizeOptionalText(nicknameValue) : null,
+    company: typeof companyValue === "string" ? normalizeOptionalText(companyValue) : null,
+    role: typeof roleValue === "string" ? normalizeOptionalText(roleValue) : null,
+    notes: typeof notesValue === "string" ? normalizeOptionalText(notesValue) : null,
+    tags,
+    starred: payload.starred ?? false,
+  });
+
+  return res.status(201).json({ person });
+});
+
+app.put("/people/:id", (req, res) => {
+  const { id } = req.params;
+  const payload = req.body ?? {};
+  const patch: {
+    name?: string;
+    nickname?: string | null;
+    company?: string | null;
+    role?: string | null;
+    notes?: string | null;
+    tags?: string[];
+    starred?: boolean;
+  } = {};
+
+  if ("name" in payload) {
+    if (typeof payload.name !== "string" || !payload.name.trim()) {
+      return res.status(400).json({ error: "`name` must be a non-empty string" });
+    }
+    patch.name = payload.name.trim();
+  }
+
+  if ("nickname" in payload) {
+    if (payload.nickname === null) {
+      patch.nickname = null;
+    } else if (typeof payload.nickname === "string") {
+      patch.nickname = normalizeOptionalText(payload.nickname);
+    } else {
+      return res.status(400).json({ error: "`nickname` must be a string or null" });
+    }
+  }
+
+  if ("company" in payload) {
+    if (payload.company === null) {
+      patch.company = null;
+    } else if (typeof payload.company === "string") {
+      patch.company = normalizeOptionalText(payload.company);
+    } else {
+      return res.status(400).json({ error: "`company` must be a string or null" });
+    }
+  }
+
+  if ("role" in payload) {
+    if (payload.role === null) {
+      patch.role = null;
+    } else if (typeof payload.role === "string") {
+      patch.role = normalizeOptionalText(payload.role);
+    } else {
+      return res.status(400).json({ error: "`role` must be a string or null" });
+    }
+  }
+
+  if ("notes" in payload) {
+    if (payload.notes === null) {
+      patch.notes = null;
+    } else if (typeof payload.notes === "string") {
+      patch.notes = normalizeOptionalText(payload.notes);
+    } else {
+      return res.status(400).json({ error: "`notes` must be a string or null" });
+    }
+  }
+
+  if ("tags" in payload) {
+    const parsed = parsePersonTagsInput(payload.tags);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+    patch.tags = parsed.tags;
+  }
+
+  if ("starred" in payload) {
+    if (typeof payload.starred !== "boolean") {
+      return res.status(400).json({ error: "`starred` must be boolean" });
+    }
+    patch.starred = payload.starred;
+  }
+
+  if (!Object.keys(patch).length) {
+    return res.status(400).json({ error: "No valid fields to update" });
+  }
+
+  const person = updatePerson(id, patch);
+  if (!person) return res.status(404).json({ error: "person not found" });
+  return res.json({ person });
+});
+
+app.delete("/people/:id", (req, res) => {
+  const { id } = req.params;
+  const deleted = deletePerson(id);
+  if (!deleted) return res.status(404).json({ error: "person not found" });
+  return res.json({ ok: true });
+});
+
+app.post("/people/:id/identifiers", (req, res) => {
+  const { id } = req.params;
+  const person = getPersonById(id);
+  if (!person) return res.status(404).json({ error: "person not found" });
+
+  const payload = req.body ?? {};
+  const typeValue = payload.type;
+  if (typeof typeValue !== "string" || !typeValue.trim()) {
+    return res.status(400).json({ error: "`type` is required" });
+  }
+  const normalizedType = typeValue.trim().toLowerCase();
+  if (!PEOPLE_IDENTIFIER_TYPE_SET.has(normalizedType)) {
+    return res
+      .status(400)
+      .json({ error: "`type` must be phone, email, imessage, or other" });
+  }
+
+  const valueValue = payload.value;
+  if (typeof valueValue !== "string" || !valueValue.trim()) {
+    return res.status(400).json({ error: "`value` is required" });
+  }
+
+  const labelValue = payload.label;
+  if (labelValue !== undefined && labelValue !== null && typeof labelValue !== "string") {
+    return res.status(400).json({ error: "`label` must be a string" });
+  }
+
+  const identifier = createPersonIdentifier({
+    person_id: id,
+    type: normalizedType as "phone" | "email" | "imessage" | "other",
+    value: valueValue.trim(),
+    label: typeof labelValue === "string" ? normalizeOptionalText(labelValue) : null,
+  });
+  if (!identifier) {
+    return res.status(400).json({ error: "invalid identifier value" });
+  }
+
+  return res.status(201).json({ identifier });
+});
+
+app.delete("/people/:id/identifiers/:iid", (req, res) => {
+  const { id, iid } = req.params;
+  const deleted = deletePersonIdentifier(id, iid);
+  if (!deleted) return res.status(404).json({ error: "identifier not found" });
+  return res.json({ ok: true });
+});
+
+app.post("/people/:id/projects", (req, res) => {
+  const { id } = req.params;
+  const person = getPersonById(id);
+  if (!person) return res.status(404).json({ error: "person not found" });
+
+  const payload = req.body ?? {};
+  const projectValue = payload.project_id ?? payload.projectId;
+  if (typeof projectValue !== "string" || !projectValue.trim()) {
+    return res.status(400).json({ error: "`project_id` is required" });
+  }
+  const projectId = projectValue.trim();
+
+  const relationshipValue = payload.relationship;
+  if (
+    relationshipValue !== undefined &&
+    relationshipValue !== null &&
+    typeof relationshipValue !== "string"
+  ) {
+    return res.status(400).json({ error: "`relationship` must be a string" });
+  }
+  const relationship =
+    typeof relationshipValue === "string" ? relationshipValue.trim().toLowerCase() : null;
+  if (relationship && !PEOPLE_PROJECT_RELATIONSHIP_SET.has(relationship)) {
+    return res.status(400).json({
+      error: "`relationship` must be stakeholder, collaborator, client, vendor, or other",
+    });
+  }
+
+  const notesValue = payload.notes;
+  if (notesValue !== undefined && notesValue !== null && typeof notesValue !== "string") {
+    return res.status(400).json({ error: "`notes` must be a string" });
+  }
+
+  const existing = getPersonProject(id, projectId);
+  if (existing) {
+    return res.status(409).json({ error: "project association already exists" });
+  }
+
+  const project = createPersonProject({
+    person_id: id,
+    project_id: projectId,
+    relationship: relationship
+      ? (relationship as "stakeholder" | "collaborator" | "client" | "vendor" | "other")
+      : undefined,
+    notes: typeof notesValue === "string" ? normalizeOptionalText(notesValue) : null,
+  });
+
+  return res.status(201).json({ project });
+});
+
+app.delete("/people/:id/projects/:pid", (req, res) => {
+  const { id, pid } = req.params;
+  const deleted = deletePersonProject(id, pid);
+  if (!deleted) return res.status(404).json({ error: "project association not found" });
+  return res.json({ ok: true });
+});
+
+app.get("/people/:id/conversations", (req, res) => {
+  const { id } = req.params;
+  const person = getPersonById(id);
+  if (!person) return res.status(404).json({ error: "person not found" });
+
+  if (req.query.channel !== undefined && typeof req.query.channel !== "string") {
+    return res.status(400).json({ error: "`channel` must be a string" });
+  }
+  if (req.query.since !== undefined && typeof req.query.since !== "string") {
+    return res.status(400).json({ error: "`since` must be a string" });
+  }
+  if (req.query.until !== undefined && typeof req.query.until !== "string") {
+    return res.status(400).json({ error: "`until` must be a string" });
+  }
+  if (req.query.limit !== undefined && typeof req.query.limit !== "string") {
+    return res.status(400).json({ error: "`limit` must be a string" });
+  }
+  if (req.query.offset !== undefined && typeof req.query.offset !== "string") {
+    return res.status(400).json({ error: "`offset` must be a string" });
+  }
+
+  const channelRaw =
+    typeof req.query.channel === "string" ? req.query.channel.trim().toLowerCase() : "";
+  if (channelRaw && !CONVERSATION_CHANNEL_SET.has(channelRaw)) {
+    return res.status(400).json({ error: "`channel` is invalid" });
+  }
+
+  const sinceRaw = typeof req.query.since === "string" ? req.query.since.trim() : "";
+  const untilRaw = typeof req.query.until === "string" ? req.query.until.trim() : "";
+  let since: string | null = null;
+  let until: string | null = null;
+
+  if (sinceRaw) {
+    const parsed = Date.parse(sinceRaw);
+    if (!Number.isFinite(parsed)) {
+      return res.status(400).json({ error: "`since` must be an ISO timestamp" });
+    }
+    since = new Date(parsed).toISOString();
+  }
+  if (untilRaw) {
+    const parsed = Date.parse(untilRaw);
+    if (!Number.isFinite(parsed)) {
+      return res.status(400).json({ error: "`until` must be an ISO timestamp" });
+    }
+    until = new Date(parsed).toISOString();
+  }
+
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const offsetRaw = typeof req.query.offset === "string" ? Number(req.query.offset) : NaN;
+  const limit = Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : undefined;
+  const offset = Number.isFinite(offsetRaw) ? Math.trunc(offsetRaw) : undefined;
+
+  const events = listConversationEvents({
+    person_id: id,
+    channel: channelRaw ? (channelRaw as ConversationChannel) : null,
+    since,
+    until,
+    limit,
+    offset,
+  });
+
+  return res.json({ events });
+});
+
+app.get("/people/:id/conversations/summary", (req, res) => {
+  const { id } = req.params;
+  const person = getPersonById(id);
+  if (!person) return res.status(404).json({ error: "person not found" });
+
+  const summary = getConversationSummary(id);
+  return res.json({ summary });
+});
+
+app.post("/people/:id/conversations/sync", async (req, res) => {
+  const { id } = req.params;
+  const person = getPersonById(id);
+  if (!person) return res.status(404).json({ error: "person not found" });
+
+  let channels: ConversationChannel[] | undefined;
+  if (req.body && typeof req.body === "object" && "channels" in req.body) {
+    const value = (req.body as Record<string, unknown>).channels;
+    if (!Array.isArray(value)) {
+      return res.status(400).json({ error: "`channels` must be an array" });
+    }
+    const parsed: ConversationChannel[] = [];
+    for (const entry of value) {
+      if (typeof entry !== "string") {
+        return res.status(400).json({ error: "`channels` must be an array of strings" });
+      }
+      const normalized = entry.trim().toLowerCase();
+      if (!CONVERSATION_SYNC_CHANNEL_SET.has(normalized)) {
+        return res.status(400).json({ error: `unknown channel: ${entry}` });
+      }
+      parsed.push(normalized as ConversationChannel);
+    }
+    channels = parsed;
+  }
+
+  const result = await syncPersonConversations(id, {
+    channels,
+    reason: "on_demand",
+  });
+  return res.json(result);
+});
+
+function normalizeStringArrayField(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  const entries = Array.isArray(value) ? value : [value];
+  return entries
+    .map((entry) => {
+      if (typeof entry === "string") return entry.trim();
+      if (typeof entry === "number" || typeof entry === "boolean") return String(entry);
+      return "";
+    })
+    .filter(Boolean);
+}
+
+function normalizePatternTags(tags: string[]): string[] {
+  const normalized = tags
+    .map((tag) => tag.trim().toLowerCase())
+    .filter(Boolean);
+  return Array.from(new Set(normalized));
+}
+
+function normalizeDecisionArrayField(value: unknown): ShiftHandoffDecision[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) return [];
+  const decisions: ShiftHandoffDecision[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const decision = typeof record.decision === "string" ? record.decision.trim() : "";
+    const rationale = typeof record.rationale === "string" ? record.rationale.trim() : "";
+    if (!decision || !rationale) continue;
+    decisions.push({ decision, rationale });
+  }
+  return decisions;
+}
+
+function parsePatternTagsQuery(
+  value: unknown
+): { ok: true; tags: string[] } | { ok: false; error: string } {
+  if (value === undefined) {
+    return { ok: false, error: "`tags` query param is required" };
+  }
+  const entries = Array.isArray(value) ? value : [value];
+  const tags: string[] = [];
+  for (const entry of entries) {
+    if (typeof entry !== "string") {
+      return { ok: false, error: "`tags` must be a comma-separated string" };
+    }
+    for (const part of entry.split(",")) {
+      const trimmed = part.trim();
+      if (trimmed) tags.push(trimmed);
+    }
+  }
+  const normalized = normalizePatternTags(tags);
+  if (!normalized.length) {
+    return { ok: false, error: "`tags` must include at least one value" };
+  }
+  return { ok: true, tags: normalized };
+}
+
+function parseCreatePatternInput(
+  payload: unknown
+): { ok: true; input: CreateGlobalPatternInput } | { ok: false; error: string } {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+  const record = payload as Record<string, unknown>;
+  const nameRaw = typeof record.name === "string" ? record.name.trim() : "";
+  if (!nameRaw) return { ok: false, error: "`name` must be a non-empty string" };
+  const descriptionRaw =
+    typeof record.description === "string" ? record.description.trim() : "";
+  if (!descriptionRaw) {
+    return { ok: false, error: "`description` must be a non-empty string" };
+  }
+  const tagsRaw = normalizeStringArrayField(record.tags) ?? [];
+  const tags = normalizePatternTags(tagsRaw);
+  if (!tags.length) {
+    return { ok: false, error: "`tags` must include at least one value" };
+  }
+  const sourceProjectRaw =
+    typeof record.source_project === "string" ? record.source_project.trim() : "";
+  if (!sourceProjectRaw) {
+    return { ok: false, error: "`source_project` must be a non-empty string" };
+  }
+  const sourceWoRaw =
+    typeof record.source_wo === "string" ? record.source_wo.trim() : "";
+  if (!sourceWoRaw) {
+    return { ok: false, error: "`source_wo` must be a non-empty string" };
+  }
+
+  const implementationNotes =
+    typeof record.implementation_notes === "string"
+      ? record.implementation_notes.trim()
+      : null;
+  const successMetrics =
+    typeof record.success_metrics === "string" ? record.success_metrics.trim() : null;
+  const createdAt =
+    typeof record.created_at === "string" && record.created_at.trim()
+      ? record.created_at.trim()
+      : undefined;
+
+  return {
+    ok: true,
+    input: {
+      name: nameRaw,
+      description: descriptionRaw,
+      tags,
+      source_project: sourceProjectRaw,
+      source_wo: sourceWoRaw,
+      implementation_notes: implementationNotes,
+      success_metrics: successMetrics,
+      created_at: createdAt,
+    },
+  };
+}
+
+type WorkOrderFromPatternInput = {
+  pattern_id: string;
+  title?: string;
+};
+
+function parseWorkOrderFromPatternInput(
+  payload: unknown
+): { ok: true; input: WorkOrderFromPatternInput } | { ok: false; error: string } {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+  const record = payload as Record<string, unknown>;
+  const patternId = typeof record.pattern_id === "string" ? record.pattern_id.trim() : "";
+  if (!patternId) {
+    return { ok: false, error: "`pattern_id` must be a non-empty string" };
+  }
+  const title =
+    typeof record.title === "string" && record.title.trim()
+      ? record.title.trim()
+      : undefined;
+
+  return { ok: true, input: { pattern_id: patternId, title } };
+}
+
+function parseStartShiftInput(
+  payload: unknown
+):
+  | { ok: true; input: { agentType?: string; agentId?: string; timeoutMinutes?: number } }
+  | { ok: false; error: string } {
+  if (payload === undefined || payload === null) {
+    return { ok: true, input: {} };
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+
+  const record = payload as Record<string, unknown>;
+  const input: { agentType?: string; agentId?: string; timeoutMinutes?: number } = {};
+
+  if ("agent_type" in record) {
+    if (typeof record.agent_type !== "string" || !record.agent_type.trim()) {
+      return { ok: false, error: "`agent_type` must be a non-empty string" };
+    }
+    input.agentType = record.agent_type.trim();
+  }
+
+  if ("agent_id" in record) {
+    if (typeof record.agent_id !== "string" || !record.agent_id.trim()) {
+      return { ok: false, error: "`agent_id` must be a non-empty string" };
+    }
+    input.agentId = record.agent_id.trim();
+  }
+
+  if ("timeout_minutes" in record) {
+    if (
+      typeof record.timeout_minutes !== "number" ||
+      !Number.isFinite(record.timeout_minutes) ||
+      record.timeout_minutes <= 0
+    ) {
+      return { ok: false, error: "`timeout_minutes` must be a positive number" };
+    }
+    input.timeoutMinutes = record.timeout_minutes;
+  }
+
+  return { ok: true, input };
+}
+
+function parseCreateShiftHandoffInput(
+  payload: unknown
+):
+  | { ok: true; input: CreateShiftHandoffInput }
+  | { ok: false; error: string } {
+  if (!payload || typeof payload !== "object") {
+    return { ok: false, error: "request body required" };
+  }
+  const record = payload as Record<string, unknown>;
+  const summaryRaw = record.summary;
+  if (typeof summaryRaw !== "string" || !summaryRaw.trim()) {
+    return { ok: false, error: "`summary` must be a non-empty string" };
+  }
+
+  const input: CreateShiftHandoffInput = {
+    summary: summaryRaw.trim(),
+  };
+  const work_completed = normalizeStringArrayField(record.work_completed);
+  const recommendations = normalizeStringArrayField(record.recommendations);
+  const blockers = normalizeStringArrayField(record.blockers);
+  const next_priorities = normalizeStringArrayField(record.next_priorities);
+  const decisions_made = normalizeDecisionArrayField(record.decisions_made);
+
+  if (work_completed !== undefined) input.work_completed = work_completed;
+  if (recommendations !== undefined) input.recommendations = recommendations;
+  if (blockers !== undefined) input.blockers = blockers;
+  if (next_priorities !== undefined) input.next_priorities = next_priorities;
+  if (decisions_made !== undefined) input.decisions_made = decisions_made;
+  if (typeof record.agent_id === "string" && record.agent_id.trim()) {
+    input.agent_id = record.agent_id.trim();
+  }
+  if (typeof record.duration_minutes === "number" && Number.isFinite(record.duration_minutes)) {
+    input.duration_minutes = record.duration_minutes;
+  }
+
+  return { ok: true, input };
+}
+
+function parseProjectStateField(
+  value: unknown
+):
+  | { ok: true; state: CreateGlobalShiftHandoffInput["project_state"] | undefined }
+  | { ok: false; error: string } {
+  if (value === undefined) return { ok: true, state: undefined };
+  if (value === null) return { ok: true, state: null };
+  if (typeof value === "string") {
+    try {
+      return {
+        ok: true,
+        state: JSON.parse(value) as CreateGlobalShiftHandoffInput["project_state"],
+      };
+    } catch {
+      return { ok: false, error: "`project_state` must be valid JSON" };
+    }
+  }
+  if (typeof value === "object") {
+    return {
+      ok: true,
+      state: value as CreateGlobalShiftHandoffInput["project_state"],
+    };
+  }
+  return { ok: false, error: "`project_state` must be an object or JSON string" };
+}
+
+function parseCreateGlobalShiftHandoffInput(
+  payload: unknown
+):
+  | { ok: true; input: CreateGlobalShiftHandoffInput }
+  | { ok: false; error: string } {
+  if (!payload || typeof payload !== "object") {
+    return { ok: false, error: "request body required" };
+  }
+  const record = payload as Record<string, unknown>;
+  const summaryRaw = record.summary;
+  if (typeof summaryRaw !== "string" || !summaryRaw.trim()) {
+    return { ok: false, error: "`summary` must be a non-empty string" };
+  }
+
+  const input: CreateGlobalShiftHandoffInput = {
+    summary: summaryRaw.trim(),
+  };
+  const actions_taken = normalizeStringArrayField(record.actions_taken);
+  const pending_items = normalizeStringArrayField(record.pending_items);
+  const decisions_made = normalizeDecisionArrayField(record.decisions_made);
+  const project_state = parseProjectStateField(record.project_state);
+  if (!project_state.ok) return { ok: false, error: project_state.error };
+
+  if (actions_taken !== undefined) input.actions_taken = actions_taken;
+  if (pending_items !== undefined) input.pending_items = pending_items;
+  if (decisions_made !== undefined) input.decisions_made = decisions_made;
+  if (project_state.state !== undefined) input.project_state = project_state.state;
+  if (typeof record.agent_id === "string" && record.agent_id.trim()) {
+    input.agent_id = record.agent_id.trim();
+  }
+  if (typeof record.duration_minutes === "number" && Number.isFinite(record.duration_minutes)) {
+    input.duration_minutes = record.duration_minutes;
+  }
+
+  return { ok: true, input };
+}
+
+function parseAbandonShiftInput(
+  payload: unknown
+):
+  | { ok: true; reason: string | null }
+  | { ok: false; error: string } {
+  if (payload === undefined || payload === null) {
+    return { ok: true, reason: null };
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+  const record = payload as Record<string, unknown>;
+  if (!("reason" in record)) {
+    return { ok: true, reason: null };
+  }
+  if (typeof record.reason !== "string") {
+    return { ok: false, error: "`reason` must be a string" };
+  }
+  const trimmed = record.reason.trim();
+  return { ok: true, reason: trimmed ? trimmed : null };
+}
+
+const PROJECT_STATUS_SET = new Set<ProjectRow["status"]>(["active", "blocked", "parked"]);
+const PROJECT_LIFECYCLE_STATUS_SET = new Set(PROJECT_LIFECYCLE_STATUSES);
+
+function parseCreateProjectInput(
+  payload: unknown
+): { ok: true; input: CreateProjectInput } | { ok: false; error: string } {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+  const record = payload as Record<string, unknown>;
+  const pathRaw = typeof record.path === "string" ? record.path.trim() : "";
+  if (!pathRaw) return { ok: false, error: "`path` must be a non-empty string" };
+  const name = typeof record.name === "string" ? record.name.trim() : "";
+  const id = typeof record.id === "string" ? record.id.trim() : "";
+  const statusRaw = typeof record.status === "string" ? record.status.trim() : "";
+  const lifecycleRaw =
+    typeof record.lifecycle_status === "string" ? record.lifecycle_status.trim() : "";
+  const template =
+    typeof record.template === "string" ? record.template.trim().toLowerCase() : "";
+  if (statusRaw && !PROJECT_STATUS_SET.has(statusRaw as ProjectRow["status"])) {
+    return { ok: false, error: "`status` must be active, blocked, or parked" };
+  }
+  if (
+    lifecycleRaw &&
+    !PROJECT_LIFECYCLE_STATUS_SET.has(lifecycleRaw as ProjectRow["lifecycle_status"])
+  ) {
+    return {
+      ok: false,
+      error: "`lifecycle_status` must be active, stable, maintenance, or archived",
+    };
+  }
+  const priorityRaw = typeof record.priority === "number" ? record.priority : NaN;
+  if (Number.isFinite(priorityRaw) && priorityRaw <= 0) {
+    return { ok: false, error: "`priority` must be a positive number" };
+  }
+  const initGit =
+    typeof record.init_git === "boolean" ? record.init_git : undefined;
+
+  return {
+    ok: true,
+    input: {
+      path: pathRaw,
+      name: name || undefined,
+      id: id || undefined,
+      status: statusRaw ? (statusRaw as ProjectRow["status"]) : undefined,
+      lifecycle_status: lifecycleRaw ? (lifecycleRaw as ProjectRow["lifecycle_status"]) : undefined,
+      priority: Number.isFinite(priorityRaw) ? Math.trunc(priorityRaw) : undefined,
+      init_git: initGit,
+      template: template || undefined,
+    },
+  };
+}
+
+type InitiativeCreateInput = {
+  name: string;
+  description: string;
+  target_date: string;
+  status: InitiativeStatus;
+  projects: string[];
+  milestones: InitiativeMilestone[];
+};
+
+type InitiativePlanRequest = {
+  plan: InitiativePlan | null;
+  guidance: string | null;
+};
+
+type InitiativeNotifyRequest = {
+  plan: InitiativePlan | null;
+  guidance: string | null;
+  start_shifts: boolean;
+  spawn_shifts: boolean;
+};
+
+function parseInitiativeMilestones(
+  raw: unknown
+): { ok: true; milestones: InitiativeMilestone[] } | { ok: false; error: string } {
+  if (raw === undefined) return { ok: true, milestones: [] };
+  if (!Array.isArray(raw)) {
+    return { ok: false, error: "`milestones` must be an array" };
+  }
+  const milestones: InitiativeMilestone[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const record = entry as Record<string, unknown>;
+    const name = typeof record.name === "string" ? record.name.trim() : "";
+    const targetDate =
+      typeof record.target_date === "string" ? record.target_date.trim() : "";
+    if (!name || !targetDate) {
+      return { ok: false, error: "each milestone needs name and target_date" };
+    }
+    const wos = normalizeStringArrayField(record.wos) ?? [];
+    const rawStatus = typeof record.status === "string" ? record.status.trim() : "";
+    const status = INITIATIVE_MILESTONE_STATUS_SET.has(
+      rawStatus as InitiativeMilestone["status"]
+    )
+      ? (rawStatus as InitiativeMilestone["status"])
+      : "pending";
+    milestones.push({ name, target_date: targetDate, wos, status });
+  }
+  return { ok: true, milestones };
+}
+
+function parseInitiativeCreateInput(
+  payload: unknown
+): { ok: true; input: InitiativeCreateInput } | { ok: false; error: string } {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+  const record = payload as Record<string, unknown>;
+  const name = typeof record.name === "string" ? record.name.trim() : "";
+  if (!name) return { ok: false, error: "`name` must be a non-empty string" };
+
+  const descriptionRaw =
+    typeof record.description === "string" ? record.description.trim() : "";
+  const goalRaw = typeof record.goal === "string" ? record.goal.trim() : "";
+  const description = descriptionRaw || goalRaw;
+  if (!description) {
+    return { ok: false, error: "`description` must be a non-empty string" };
+  }
+
+  const targetDate =
+    typeof record.target_date === "string" ? record.target_date.trim() : "";
+  if (!targetDate) {
+    return { ok: false, error: "`target_date` must be a non-empty string" };
+  }
+
+  const projects =
+    normalizeStringArrayField(record.involved_projects) ??
+    normalizeStringArrayField(record.projects) ??
+    [];
+  if (!projects.length) {
+    return { ok: false, error: "`involved_projects` must be a non-empty array" };
+  }
+
+  const rawStatus = typeof record.status === "string" ? record.status.trim() : "";
+  if (rawStatus && !INITIATIVE_STATUS_SET.has(rawStatus as InitiativeStatus)) {
+    return {
+      ok: false,
+      error: "`status` must be planning, active, completed, or at_risk",
+    };
+  }
+
+  const milestonesParsed = parseInitiativeMilestones(record.milestones);
+  if (!milestonesParsed.ok) return { ok: false, error: milestonesParsed.error };
+
+  return {
+    ok: true,
+    input: {
+      name,
+      description,
+      target_date: targetDate,
+      status: rawStatus
+        ? (rawStatus as InitiativeStatus)
+        : ("planning" as InitiativeStatus),
+      projects,
+      milestones: milestonesParsed.milestones,
+    },
+  };
+}
+
+function parseInitiativePatchInput(
+  payload: unknown
+): { ok: true; patch: InitiativePatch } | { ok: false; error: string } {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+  const record = payload as Record<string, unknown>;
+  const patch: InitiativePatch = {};
+
+  if ("name" in record) {
+    const name = typeof record.name === "string" ? record.name.trim() : "";
+    if (!name) return { ok: false, error: "`name` must be a non-empty string" };
+    patch.name = name;
+  }
+
+  if ("description" in record || "goal" in record) {
+    const descriptionRaw =
+      typeof record.description === "string" ? record.description.trim() : "";
+    const goalRaw = typeof record.goal === "string" ? record.goal.trim() : "";
+    const description = descriptionRaw || goalRaw;
+    if (!description) {
+      return { ok: false, error: "`description` must be a non-empty string" };
+    }
+    patch.description = description;
+  }
+
+  if ("target_date" in record) {
+    const targetDate =
+      typeof record.target_date === "string" ? record.target_date.trim() : "";
+    if (!targetDate) {
+      return { ok: false, error: "`target_date` must be a non-empty string" };
+    }
+    patch.target_date = targetDate;
+  }
+
+  if ("status" in record) {
+    const rawStatus = typeof record.status === "string" ? record.status.trim() : "";
+    if (!rawStatus || !INITIATIVE_STATUS_SET.has(rawStatus as InitiativeStatus)) {
+      return {
+        ok: false,
+        error: "`status` must be planning, active, completed, or at_risk",
+      };
+    }
+    patch.status = rawStatus as InitiativeStatus;
+  }
+
+  if ("involved_projects" in record || "projects" in record) {
+    const projects =
+      normalizeStringArrayField(record.involved_projects) ??
+      normalizeStringArrayField(record.projects) ??
+      [];
+    if (!projects.length) {
+      return { ok: false, error: "`involved_projects` must be a non-empty array" };
+    }
+    patch.projects = projects;
+  }
+
+  if ("milestones" in record) {
+    const milestonesParsed = parseInitiativeMilestones(record.milestones);
+    if (!milestonesParsed.ok) return { ok: false, error: milestonesParsed.error };
+    patch.milestones = milestonesParsed.milestones;
+  }
+
+  return { ok: true, patch };
+}
+
+function parseInitiativePlanRequest(
+  payload: unknown,
+  initiativeId: string,
+  projectIds: string[]
+): { ok: true; input: InitiativePlanRequest } | { ok: false; error: string } {
+  if (payload === undefined || payload === null) {
+    return { ok: true, input: { plan: null, guidance: null } };
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+  const record = payload as Record<string, unknown>;
+  if ("guidance" in record && record.guidance !== null && typeof record.guidance !== "string") {
+    return { ok: false, error: "`guidance` must be a string" };
+  }
+  const guidanceRaw = typeof record.guidance === "string" ? record.guidance.trim() : "";
+  const guidance = guidanceRaw ? guidanceRaw : null;
+  let plan: InitiativePlan | null = null;
+  if ("plan" in record) {
+    plan = coerceInitiativePlanInput(record.plan, initiativeId, projectIds);
+    if (!plan) {
+      return { ok: false, error: "`plan` must match the initiative plan schema" };
+    }
+  }
+  return { ok: true, input: { plan, guidance } };
+}
+
+function parseInitiativeNotifyRequest(
+  payload: unknown,
+  initiativeId: string,
+  projectIds: string[]
+): { ok: true; input: InitiativeNotifyRequest } | { ok: false; error: string } {
+  if (payload === undefined || payload === null) {
+    return {
+      ok: true,
+      input: { plan: null, guidance: null, start_shifts: true, spawn_shifts: false },
+    };
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+  const record = payload as Record<string, unknown>;
+  if ("guidance" in record && record.guidance !== null && typeof record.guidance !== "string") {
+    return { ok: false, error: "`guidance` must be a string" };
+  }
+  const guidanceRaw = typeof record.guidance === "string" ? record.guidance.trim() : "";
+  const guidance = guidanceRaw ? guidanceRaw : null;
+  const start =
+    typeof record.start_shifts === "boolean" ? record.start_shifts : true;
+  const spawn =
+    typeof record.spawn_shifts === "boolean" ? record.spawn_shifts : false;
+  let plan: InitiativePlan | null = null;
+  if ("plan" in record) {
+    plan = coerceInitiativePlanInput(record.plan, initiativeId, projectIds);
+    if (!plan) {
+      return { ok: false, error: "`plan` must match the initiative plan schema" };
+    }
+  }
+  return {
+    ok: true,
+    input: { plan, guidance, start_shifts: start, spawn_shifts: spawn },
+  };
+}
+
+type EscalationCreateInput = {
+  type: EscalationType;
+  summary: string;
+  payload: string | null;
+  run_id: string | null;
+  shift_id: string | null;
+};
+
+type ProjectCommunicationCreateInput = {
+  intent: ProjectCommunicationIntent;
+  type: EscalationType | null;
+  summary: string;
+  body: string | null;
+  payload: string | null;
+  run_id: string | null;
+  shift_id: string | null;
+  to_scope: ProjectCommunicationScope;
+  to_project_id: string | null;
+};
+
+function serializeOptionalJson(
+  value: unknown,
+  fieldName: string
+): { ok: true; value: string | null } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true, value: null };
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return { ok: true, value: trimmed ? trimmed : null };
+  }
+  try {
+    return { ok: true, value: JSON.stringify(value) };
+  } catch {
+    return { ok: false, error: `\`${fieldName}\` must be JSON-serializable` };
+  }
+}
+
+function serializeRequiredJson(
+  value: unknown,
+  fieldName: string
+): { ok: true; value: string } | { ok: false; error: string } {
+  if (value === undefined) {
+    return { ok: false, error: `\`${fieldName}\` is required` };
+  }
+  if (value === null) {
+    return { ok: false, error: `\`${fieldName}\` must not be null` };
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return { ok: false, error: `\`${fieldName}\` must be a non-empty string` };
+    }
+    return { ok: true, value: trimmed };
+  }
+  try {
+    return { ok: true, value: JSON.stringify(value) };
+  } catch {
+    return { ok: false, error: `\`${fieldName}\` must be JSON-serializable` };
+  }
+}
+
+function parseEscalationCreateInput(
+  payload: unknown
+): { ok: true; input: EscalationCreateInput } | { ok: false; error: string } {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+  const record = payload as Record<string, unknown>;
+  const rawType = typeof record.type === "string" ? record.type.trim() : "";
+  if (!rawType || !ESCALATION_TYPE_SET.has(rawType as EscalationType)) {
+    return {
+      ok: false,
+      error:
+        "`type` must be one of need_input, blocked, decision_required, error, budget_warning, budget_critical, budget_exhausted, run_blocked",
+    };
+  }
+  const summary = typeof record.summary === "string" ? record.summary.trim() : "";
+  if (!summary) {
+    return { ok: false, error: "`summary` must be a non-empty string" };
+  }
+
+  if ("run_id" in record) {
+    if (typeof record.run_id !== "string" || !record.run_id.trim()) {
+      return { ok: false, error: "`run_id` must be a non-empty string" };
+    }
+  }
+  if ("shift_id" in record) {
+    if (typeof record.shift_id !== "string" || !record.shift_id.trim()) {
+      return { ok: false, error: "`shift_id` must be a non-empty string" };
+    }
+  }
+
+  const payloadValue = serializeOptionalJson(record.payload, "payload");
+  if (!payloadValue.ok) return { ok: false, error: payloadValue.error };
+
+  return {
+    ok: true,
+    input: {
+      type: rawType as EscalationType,
+      summary,
+      payload: payloadValue.value,
+      run_id: typeof record.run_id === "string" ? record.run_id.trim() : null,
+      shift_id: typeof record.shift_id === "string" ? record.shift_id.trim() : null,
+    },
+  };
+}
+
+function parseProjectCommunicationCreateInput(
+  payload: unknown
+): { ok: true; input: ProjectCommunicationCreateInput } | { ok: false; error: string } {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+  const record = payload as Record<string, unknown>;
+  const rawIntent = typeof record.intent === "string" ? record.intent.trim() : "";
+  if (!rawIntent || !COMMUNICATION_INTENT_SET.has(rawIntent as ProjectCommunicationIntent)) {
+    return {
+      ok: false,
+      error: "`intent` must be one of escalation, request, message, suggestion, status",
+    };
+  }
+  const intent = rawIntent as ProjectCommunicationIntent;
+  const summary = typeof record.summary === "string" ? record.summary.trim() : "";
+  if (!summary) {
+    return { ok: false, error: "`summary` must be a non-empty string" };
+  }
+  const bodyRaw = typeof record.body === "string" ? record.body.trim() : "";
+  if ("body" in record && record.body !== null && typeof record.body !== "string") {
+    return { ok: false, error: "`body` must be a string" };
+  }
+  if ("run_id" in record) {
+    if (typeof record.run_id !== "string" || !record.run_id.trim()) {
+      return { ok: false, error: "`run_id` must be a non-empty string" };
+    }
+  }
+  if ("shift_id" in record) {
+    if (typeof record.shift_id !== "string" || !record.shift_id.trim()) {
+      return { ok: false, error: "`shift_id` must be a non-empty string" };
+    }
+  }
+
+  const rawToScope = typeof record.to_scope === "string" ? record.to_scope.trim() : "";
+  const to_scope = (rawToScope || "global") as ProjectCommunicationScope;
+  if (rawToScope && !COMMUNICATION_SCOPE_SET.has(to_scope)) {
+    return { ok: false, error: "`to_scope` must be project, global, or user" };
+  }
+  let to_project_id: string | null = null;
+  if ("to_project_id" in record) {
+    if (record.to_project_id === null) {
+      to_project_id = null;
+    } else if (typeof record.to_project_id === "string" && record.to_project_id.trim()) {
+      to_project_id = record.to_project_id.trim();
+    } else {
+      return { ok: false, error: "`to_project_id` must be a non-empty string" };
+    }
+  }
+  if (to_scope === "project" && !to_project_id) {
+    return { ok: false, error: "`to_project_id` is required when to_scope=project" };
+  }
+
+  let type: EscalationType | null = null;
+  if (intent === "escalation") {
+    const rawType = typeof record.type === "string" ? record.type.trim() : "";
+    if (!rawType || !ESCALATION_TYPE_SET.has(rawType as EscalationType)) {
+      return {
+        ok: false,
+        error:
+          "`type` must be one of need_input, blocked, decision_required, error, budget_warning, budget_critical, budget_exhausted, run_blocked",
+      };
+    }
+    type = rawType as EscalationType;
+  }
+
+  const payloadValue = serializeOptionalJson(record.payload, "payload");
+  if (!payloadValue.ok) return { ok: false, error: payloadValue.error };
+
+  return {
+    ok: true,
+    input: {
+      intent,
+      type,
+      summary,
+      body: bodyRaw ? bodyRaw : null,
+      payload: payloadValue.value,
+      run_id: typeof record.run_id === "string" ? record.run_id.trim() : null,
+      shift_id: typeof record.shift_id === "string" ? record.shift_id.trim() : null,
+      to_scope,
+      to_project_id,
+    },
+  };
+}
+
+function parseEscalationResolutionInput(
+  payload: unknown
+): { ok: true; resolution: string } | { ok: false; error: string } {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { ok: false, error: "request body must be an object" };
+  }
+  const record = payload as Record<string, unknown>;
+  if (!("resolution" in record)) {
+    return { ok: false, error: "`resolution` is required" };
+  }
+  const resolved = serializeRequiredJson(record.resolution, "resolution");
+  if (!resolved.ok) return { ok: false, error: resolved.error };
+  return { ok: true, resolution: resolved.value };
+}
+
+function parseEscalationStatusQuery(
+  value: unknown
+): { ok: true; statuses: EscalationStatus[] } | { ok: false; error: string } {
+  if (value === undefined) {
+    return { ok: true, statuses: ["pending"] };
+  }
+  const entries = Array.isArray(value) ? value : [value];
+  const statuses: EscalationStatus[] = [];
+  for (const entry of entries) {
+    if (typeof entry !== "string") {
+      return { ok: false, error: "`status` must be a comma-separated string" };
+    }
+    for (const part of entry.split(",")) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      if (!ESCALATION_STATUS_SET.has(trimmed as EscalationStatus)) {
+        return {
+          ok: false,
+          error:
+            "`status` must be one of pending, claimed, resolved, escalated_to_user",
+        };
+      }
+      statuses.push(trimmed as EscalationStatus);
+    }
+  }
+  if (!statuses.length) return { ok: true, statuses: ["pending"] };
+  return { ok: true, statuses: Array.from(new Set(statuses)) };
+}
+
+type BlockedChainNode = {
+  project: string;
+  wo: string;
+  status: string;
+};
+
+type BlockedChain = {
+  chain: BlockedChainNode[];
+  blocking_wo: { project: string; wo: string };
+};
+
+function buildDependencyChains(
+  projectId: string,
+  workOrder: WorkOrder,
+  lookups: Map<string, WorkOrderLookup>,
+  path: BlockedChainNode[],
+  visited: Set<string>
+): BlockedChainNode[][] {
+  const resolved = resolveWorkOrderDependencies(workOrder, projectId, lookups);
+  if (!resolved.length) return [path];
+
+  const chains: BlockedChainNode[][] = [];
+  for (const dep of resolved) {
+    const node: BlockedChainNode = {
+      project: dep.project_id,
+      wo: dep.work_order_id,
+      status: dep.status,
+    };
+    const key = `${dep.project_id}:${dep.work_order_id}`;
+    if (visited.has(key)) {
+      chains.push([...path, node]);
+      continue;
+    }
+    const depWorkOrder = findWorkOrderFromLookups(
+      lookups,
+      dep.project_id,
+      dep.work_order_id
+    );
+    if (!depWorkOrder || depWorkOrder.depends_on.length === 0) {
+      chains.push([...path, node]);
+      continue;
+    }
+    const nextVisited = new Set(visited);
+    nextVisited.add(key);
+    const nextChains = buildDependencyChains(
+      dep.project_id,
+      depWorkOrder,
+      lookups,
+      [...path, node],
+      nextVisited
+    );
+    chains.push(...nextChains);
+  }
+
+  return chains;
+}
+
+function hasCrossProjectChain(chain: BlockedChainNode[]): boolean {
+  const projects = new Set(chain.map((node) => node.project));
+  return projects.size > 1;
+}
+
+function buildGlobalBlockedChains(): BlockedChain[] {
+  const lookups = buildGlobalWorkOrderLookups();
+  const chains: BlockedChain[] = [];
+
+  for (const lookup of lookups.values()) {
+    for (const workOrder of lookup.workOrders) {
+      if (workOrder.status === "done") continue;
+      if (!workOrder.depends_on.length) continue;
+      const resolved = resolveWorkOrderDependencies(
+        workOrder,
+        lookup.project.id,
+        lookups
+      );
+      const summary = summarizeResolvedDependencies(resolved);
+      if (summary.depsSatisfied) continue;
+
+      const rootNode: BlockedChainNode = {
+        project: lookup.project.id,
+        wo: workOrder.id,
+        status: workOrder.status,
+      };
+      const rootKey = `${lookup.project.id}:${workOrder.id}`;
+      const paths = buildDependencyChains(
+        lookup.project.id,
+        workOrder,
+        lookups,
+        [rootNode],
+        new Set([rootKey])
+      );
+      for (const chain of paths) {
+        if (!hasCrossProjectChain(chain)) continue;
+        const blocker = chain
+          .slice(1)
+          .find((node) => node.status !== "done");
+        if (!blocker) continue;
+        chains.push({
+          chain,
+          blocking_wo: { project: blocker.project, wo: blocker.wo },
+        });
+      }
+    }
+  }
+
+  return chains;
+}
+
+app.get("/global/context", (_req, res) => {
+  const response = buildGlobalContextResponse();
+  return res.json(response);
+});
+
+app.get("/global/blocked-chains", (_req, res) => {
+  return res.json(buildGlobalBlockedChains());
+});
+
+function formatInitiativeSuggestionBody(params: {
+  initiative: { id: string; name: string; target_date: string };
+  suggestions: InitiativeProjectSuggestion | null;
+}): string {
+  const tag = initiativeTag(params.initiative.id);
+  const targetDate = params.initiative.target_date
+    ? params.initiative.target_date
+    : "unspecified";
+  if (!params.suggestions || params.suggestions.suggestions.length === 0) {
+    return [
+      `Initiative "${params.initiative.name}" (target ${targetDate})`,
+      "No specific suggestions were generated for this project.",
+      `If you create WOs for this initiative, tag them with "${tag}".`,
+    ].join("\n");
+  }
+
+  const lines: string[] = [
+    `Initiative "${params.initiative.name}" (target ${targetDate})`,
+    `Please tag created WOs with "${tag}".`,
+    "",
+    "Suggested work:",
+  ];
+  for (const item of params.suggestions.suggestions) {
+    lines.push(`- ${item.suggested_title} (${item.estimated_hours}h)`);
+    lines.push(`  Goal: ${item.suggested_goal}`);
+    if (item.suggested_acceptance_criteria.length) {
+      lines.push("  Acceptance:");
+      for (const criterion of item.suggested_acceptance_criteria) {
+        lines.push(`    - ${criterion}`);
+      }
+    }
+    if (item.suggested_dependencies.length) {
+      lines.push(`  Dependencies: ${item.suggested_dependencies.join(", ")}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+app.post("/global/initiatives", (req, res) => {
+  const parsed = parseInitiativeCreateInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+  try {
+    const created = createInitiative(parsed.input);
+    const initiative = buildInitiativeProgress(created);
+    return res.status(201).json({ initiative });
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "failed to create initiative",
+    });
+  }
+});
+
+app.get("/global/initiatives", (req, res) => {
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.trunc(limitRaw)) : 50;
+  const initiatives = listInitiatives(limit).map((initiative) =>
+    buildInitiativeProgress(initiative)
+  );
+  return res.json({ initiatives });
+});
+
+app.get("/global/initiatives/:id", (req, res) => {
+  const { id } = req.params;
+  const initiative = getInitiativeById(id);
+  if (!initiative) return res.status(404).json({ error: "initiative not found" });
+  return res.json({ initiative: buildInitiativeProgress(initiative) });
+});
+
+app.patch("/global/initiatives/:id", (req, res) => {
+  const { id } = req.params;
+  if (!id || !id.trim()) {
+    return res.status(400).json({ error: "`id` must be provided" });
+  }
+  const parsed = parseInitiativePatchInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+  const updated = updateInitiative(id, parsed.patch);
+  if (!updated) return res.status(404).json({ error: "initiative not found" });
+  return res.json({ initiative: buildInitiativeProgress(updated) });
+});
+
+app.delete("/global/initiatives/:id", (req, res) => {
+  const { id } = req.params;
+  if (!id || !id.trim()) {
+    return res.status(400).json({ error: "`id` must be provided" });
+  }
+  const deleted = deleteInitiative(id);
+  if (!deleted) return res.status(404).json({ error: "initiative not found" });
+  return res.json({ ok: true, id });
+});
+
+app.get("/global/initiatives/:id/critical-path", (req, res) => {
+  const { id } = req.params;
+  const initiative = getInitiativeById(id);
+  if (!initiative) return res.status(404).json({ error: "initiative not found" });
+  const summary = buildInitiativeProgress(initiative);
+  return res.json({
+    initiative_id: initiative.id,
+    critical_path: summary.critical_path,
+    total_wos: summary.total_wos,
+    completed_wos: summary.completed_wos,
+    blocked_wos: summary.blocked_wos,
+  });
+});
+
+app.post("/global/initiatives/:id/plan", async (req, res) => {
+  const { id } = req.params;
+  const initiative = getInitiativeById(id);
+  if (!initiative) return res.status(404).json({ error: "initiative not found" });
+
+  const parsed = parseInitiativePlanRequest(req.body, initiative.id, initiative.projects);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+
+  const projectRows = initiative.projects
+    .map((projectId) => findProjectById(projectId))
+    .filter(Boolean) as ProjectRow[];
+  if (!projectRows.length) {
+    return res.status(400).json({ error: "initiative has no valid projects" });
+  }
+
+  let plan = parsed.input.plan;
+  if (!plan) {
+    try {
+      plan = await generateInitiativePlan({
+        initiative,
+        projects: projectRows,
+        projectPath: projectRows[0]?.path,
+        guidance: parsed.input.guidance,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : "failed to generate plan",
+      });
+    }
+  }
+
+  return res.json({
+    initiative: buildInitiativeProgress(initiative),
+    plan,
+    suggestions: plan.suggestions,
+  });
+});
+
+app.post("/global/initiatives/:id/notify-projects", async (req, res) => {
+  const { id } = req.params;
+  const initiative = getInitiativeById(id);
+  if (!initiative) return res.status(404).json({ error: "initiative not found" });
+
+  const parsed = parseInitiativeNotifyRequest(req.body, initiative.id, initiative.projects);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+
+  const projectRows = initiative.projects
+    .map((projectId) => findProjectById(projectId))
+    .filter(Boolean) as ProjectRow[];
+  if (!projectRows.length) {
+    return res.status(400).json({ error: "initiative has no valid projects" });
+  }
+
+  let plan = parsed.input.plan;
+  if (!plan) {
+    try {
+      plan = await generateInitiativePlan({
+        initiative,
+        projects: projectRows,
+        projectPath: projectRows[0]?.path,
+        guidance: parsed.input.guidance,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : "failed to generate plan",
+      });
+    }
+  }
+
+  const suggestions = groupPlanSuggestionsByProject(plan);
+  const suggestionsByProject = new Map(
+    suggestions.map((entry) => [entry.project_id, entry])
+  );
+
+  const notifications = projectRows.map((project) => {
+    const projectSuggestion = suggestionsByProject.get(project.id) ?? null;
+    const summary = `Initiative ${initiative.name}: suggested work`;
+    const body = formatInitiativeSuggestionBody({
+      initiative: { id: initiative.id, name: initiative.name, target_date: initiative.target_date },
+      suggestions: projectSuggestion,
+    });
+    const payload = JSON.stringify({
+      initiative_id: initiative.id,
+      initiative_name: initiative.name,
+      target_date: initiative.target_date,
+      tag: initiativeTag(initiative.id),
+      suggestions: projectSuggestion?.suggestions ?? [],
+    });
+
+    const communication = createProjectCommunication({
+      project_id: project.id,
+      intent: "suggestion",
+      summary,
+      body,
+      payload,
+      from_scope: "global",
+      to_scope: "project",
+      to_project_id: project.id,
+    });
+
+    let shift = null;
+    let shift_started = false;
+    let shift_error: string | null = null;
+
+    if (parsed.input.start_shifts) {
+      const result = startShift({
+        projectId: project.id,
+        agentType: "global_agent",
+        agentId: getGlobalAgentId(),
+      });
+      if (result.ok) {
+        shift_started = true;
+        shift = result.shift;
+        if (parsed.input.spawn_shifts) {
+          try {
+            const spawned = spawnShiftAgent({
+              projectId: project.id,
+              projectPath: project.path,
+              shift: result.shift,
+            });
+            shift = { ...result.shift, pid: spawned.pid } as typeof result.shift & {
+              pid: number;
+            };
+          } catch (err) {
+            const message =
+              err instanceof Error ? err.message : "failed to spawn shift agent";
+            updateShift(result.shift.id, {
+              status: "failed",
+              completed_at: new Date().toISOString(),
+              error: message,
+            });
+            shift_error = message;
+          }
+        }
+      } else {
+        shift = result.activeShift;
+      }
+    }
+
+    return {
+      project_id: project.id,
+      communication_id: communication.id,
+      shift_started,
+      shift,
+      shift_error,
+    };
+  });
+
+  let updatedInitiative = initiative;
+  if (plan.suggestions.length) {
+    const sentAt = new Date().toISOString();
+    const sentUpdates = plan.suggestions.map((suggestion) => ({
+      project_id: suggestion.project_id,
+      suggested_title: suggestion.suggested_title,
+      sent_at: sentAt,
+    }));
+    const existing = initiative.suggestions_sent ?? [];
+    const updated = updateInitiative(initiative.id, {
+      suggestions_sent: [...existing, ...sentUpdates],
+    });
+    if (updated) updatedInitiative = updated;
+  }
+
+  return res.json({
+    initiative: buildInitiativeProgress(updatedInitiative),
+    plan,
+    suggestions: plan.suggestions,
+    notifications,
+  });
+});
+
+app.get("/global/preferences", (_req, res) => {
+  return res.json(getUserPreferences());
+});
+
+app.patch("/global/preferences", (req, res) => {
+  const parsed = parsePreferencesPatch(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+  const updated = updateExplicitPreferences(parsed.patch);
+  try {
+    createUserInteraction({
+      action_type: "preferences_updated",
+      context: { scope: "global" },
+    });
+  } catch {
+    // Ignore interaction logging failures.
+  }
+  return res.json(updated);
+});
+
+app.get("/global/preferences/patterns", (_req, res) => {
+  return res.json(getPreferencePatterns());
+});
+
+app.get("/global/escalations", (req, res) => {
+  const parsedStatus = parseEscalationStatusQuery(req.query.status);
+  if (!parsedStatus.ok) return res.status(400).json({ error: parsedStatus.error });
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.trunc(limitRaw)) : 100;
+  const escalations = listEscalations({
+    statuses: parsedStatus.statuses,
+    order: "asc",
+    limit,
+  });
+  return res.json({ escalations });
+});
+
+app.get("/global/patterns", (req, res) => {
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.trunc(limitRaw)) : 100;
+  const patterns = listGlobalPatterns(limit);
+  return res.json({ patterns });
+});
+
+app.get("/global/patterns/search", (req, res) => {
+  const parsedTags = parsePatternTagsQuery(req.query.tags);
+  if (!parsedTags.ok) return res.status(400).json({ error: parsedTags.error });
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.trunc(limitRaw)) : 50;
+  const patterns = searchGlobalPatternsByTags(parsedTags.tags, limit);
+  return res.json({ tags: parsedTags.tags, patterns });
+});
+
+app.post("/global/patterns", (req, res) => {
+  const parsed = parseCreatePatternInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+  try {
+    const created = createGlobalPattern(parsed.input);
+    return res.status(201).json(created);
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "failed to create pattern",
+    });
+  }
+});
+
+app.get("/projects/templates", (_req, res) => {
+  return res.json({ templates: listProjectTemplates() });
+});
+
+app.post("/projects", (req, res) => {
+  const parsed = parseCreateProjectInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+  const created = createProjectFromSpec(parsed.input);
+  if (!created.ok) return res.status(400).json({ error: created.error });
+  const project = findProjectById(created.projectId);
+  return res.status(201).json({
+    project: project ?? { id: created.projectId, path: created.path },
+  });
+});
+
+app.get("/projects/:id/lifecycle", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const runs = getRunsForProject(project.id, 200);
+  const lifecycle = buildProjectLifecycleSummary({ project, runs });
+  return res.json({ project_id: project.id, lifecycle });
+});
+
+app.patch("/projects/:id/lifecycle", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const record = req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>) : {};
+  const statusRaw =
+    typeof record.lifecycle_status === "string"
+      ? record.lifecycle_status.trim().toLowerCase()
+      : typeof record.status === "string"
+        ? record.status.trim().toLowerCase()
+        : "";
+  if (!statusRaw) {
+    return res.status(400).json({ error: "`lifecycle_status` is required" });
+  }
+  if (!PROJECT_LIFECYCLE_STATUS_SET.has(statusRaw as ProjectRow["lifecycle_status"])) {
+    return res.status(400).json({
+      error: "`lifecycle_status` must be active, stable, maintenance, or archived",
+    });
+  }
+  const updated = updateProjectLifecycleStatus(
+    project.id,
+    statusRaw as ProjectRow["lifecycle_status"]
+  );
+  return res.json({ project: updated ?? project });
+});
+
+app.post("/global/shifts", (req, res) => {
+  const parsed = parseStartShiftInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+  const result = startGlobalShift({
+    agentType: parsed.input.agentType,
+    agentId: parsed.input.agentId,
+    timeoutMinutes: parsed.input.timeoutMinutes,
+  });
+  if (!result.ok) {
+    return res.status(409).json({
+      error: "shift already active",
+      active_shift: result.activeShift,
+    });
+  }
+  return res.status(201).json(result.shift);
+});
+
+app.get("/global/shifts/active", (_req, res) => {
+  const shift = getActiveGlobalShift();
+  return res.json(shift ?? null);
+});
+
+app.get("/global/shifts", (req, res) => {
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit = Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 10;
+  const shifts = listGlobalShifts(limit);
+  return res.json(shifts);
+});
+
+app.post("/global/shifts/:shiftId/complete", (req, res) => {
+  const { shiftId } = req.params;
+  if (!shiftId || !shiftId.trim()) {
+    return res.status(400).json({ error: "`shiftId` must be provided" });
+  }
+
+  const parsed = parseCreateGlobalShiftHandoffInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+
+  expireStaleGlobalShifts();
+  const shift = getGlobalShiftById(shiftId);
+  if (!shift) return res.status(404).json({ error: "shift not found" });
+  if (shift.status !== "active") {
+    return res.status(409).json({ error: "shift not active", status: shift.status });
+  }
+
+  try {
+    const input = { ...parsed.input };
+    if (input.project_state === undefined) {
+      input.project_state = buildGlobalContextResponse();
+    }
+    const handoff = createGlobalShiftHandoff({
+      shiftId,
+      input,
+    });
+    const completedAt = new Date().toISOString();
+    const updatedOk = updateGlobalShift(shift.id, {
+      status: "completed",
+      completed_at: completedAt,
+      handoff_id: handoff.id,
+      error: null,
+    });
+    if (!updatedOk) {
+      return res.status(500).json({ error: "failed to update shift" });
+    }
+    const updatedShift =
+      getGlobalShiftById(shiftId) ??
+      ({
+        ...shift,
+        status: "completed",
+        completed_at: completedAt,
+        handoff_id: handoff.id,
+        error: null,
+      } as const);
+    return res.json({ shift: updatedShift, handoff });
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "failed to complete shift",
+    });
+  }
+});
+
+app.post("/global/shifts/:shiftId/handoff", (req, res) => {
+  const { shiftId } = req.params;
+  if (!shiftId || !shiftId.trim()) {
+    return res.status(400).json({ error: "`shiftId` must be provided" });
+  }
+  const parsed = parseCreateGlobalShiftHandoffInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+  expireStaleGlobalShifts();
+  const shift = getGlobalShiftById(shiftId);
+  if (!shift) return res.status(404).json({ error: "shift not found" });
+  if (shift.status !== "active") {
+    return res.status(409).json({ error: "shift not active", status: shift.status });
+  }
+  try {
+    const input = { ...parsed.input };
+    if (input.project_state === undefined) {
+      input.project_state = buildGlobalContextResponse();
+    }
+    const handoff = createGlobalShiftHandoff({
+      shiftId,
+      input,
+    });
+    return res.status(201).json(handoff);
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "failed to create handoff",
+    });
+  }
+});
+
+app.get("/global/sessions/active", (req, res) => {
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit = Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 50;
+  const session = getActiveGlobalAgentSession();
+  if (!session) {
+    return res.json({ session: null, events: [] });
+  }
+  const events = listGlobalAgentSessionEvents({ sessionId: session.id, limit });
+  return res.json({ session, events });
+});
+
+app.get("/global/sessions/:sessionId/events", (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId || !sessionId.trim()) {
+    return res.status(400).json({ error: "`sessionId` must be provided" });
+  }
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit = Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 50;
+  const events = listGlobalAgentSessionEvents({ sessionId, limit });
+  return res.json({ events });
+});
+
+app.post("/global/sessions", (_req, res) => {
+  const created = createGlobalAgentSession();
+  if (!created.ok) {
+    return res.status(409).json({
+      error: created.error,
+      active_session: created.activeSession ?? null,
+    });
+  }
+  return res.status(201).json({ session: created.session });
+});
+
+app.patch("/global/sessions/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId || !sessionId.trim()) {
+    return res.status(400).json({ error: "`sessionId` must be provided" });
+  }
+  const updated = updateGlobalAgentSessionDetails(sessionId, req.body);
+  if (!updated.ok) return res.status(400).json({ error: updated.error });
+  return res.json({ session: updated.session });
+});
+
+app.post("/global/sessions/:sessionId/onboarding/complete", (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId || !sessionId.trim()) {
+    return res.status(400).json({ error: "`sessionId` must be provided" });
+  }
+  const result = completeGlobalAgentOnboarding(sessionId);
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  return res.json({ session: result.session });
+});
+
+app.post("/global/sessions/:sessionId/start", (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId || !sessionId.trim()) {
+    return res.status(400).json({ error: "`sessionId` must be provided" });
+  }
+  const resume = Boolean(req.body && typeof req.body === "object" && "resume" in req.body && req.body.resume);
+  const result = startGlobalAgentSessionAutonomous({ sessionId, resume });
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  return res.json({ session: result.session });
+});
+
+app.post("/global/sessions/:sessionId/pause", (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId || !sessionId.trim()) {
+    return res.status(400).json({ error: "`sessionId` must be provided" });
+  }
+  const result = pauseGlobalAgentSession(sessionId, "user_pause");
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  return res.json({ session: result.session });
+});
+
+app.post("/global/sessions/:sessionId/stop", (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId || !sessionId.trim()) {
+    return res.status(400).json({ error: "`sessionId` must be provided" });
+  }
+  const result = stopGlobalAgentSession(sessionId, "Stopped by user");
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  return res.json({ session: result.session, summary: result.summary });
+});
+
+app.post("/global/sessions/:sessionId/end", (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId || !sessionId.trim()) {
+    return res.status(400).json({ error: "`sessionId` must be provided" });
+  }
+  const result = endGlobalAgentSession(sessionId);
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  return res.json({ session: result.session });
+});
+
+app.post("/projects/:id/escalations", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const parsed = parseEscalationCreateInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+
+  const escalation = createEscalation({
+    project_id: project.id,
+    type: parsed.input.type,
+    summary: parsed.input.summary,
+    payload: parsed.input.payload,
+    run_id: parsed.input.run_id,
+    shift_id: parsed.input.shift_id,
+  });
+
+  return res.status(201).json(escalation);
+});
+
+app.post("/projects/:id/communications", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const parsed = parseProjectCommunicationCreateInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+
+  if (parsed.input.to_project_id) {
+    const target = findProjectById(parsed.input.to_project_id);
+    if (!target) {
+      return res.status(404).json({ error: "recipient project not found" });
+    }
+  }
+
+  const communication = createProjectCommunication({
+    project_id: project.id,
+    intent: parsed.input.intent,
+    type: parsed.input.type,
+    summary: parsed.input.summary,
+    body: parsed.input.body,
+    payload: parsed.input.payload,
+    run_id: parsed.input.run_id,
+    shift_id: parsed.input.shift_id,
+    from_scope: "project",
+    from_project_id: project.id,
+    to_scope: parsed.input.to_scope,
+    to_project_id: parsed.input.to_project_id,
+  });
+
+  return res.status(201).json(communication);
+});
+
+app.get("/projects/:id/communications/inbox", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.trunc(limitRaw)) : 100;
+  const communications = listProjectCommunications({
+    toScope: "project",
+    toProjectId: project.id,
+    statuses: ["pending", "claimed", "escalated_to_user"],
+    order: "asc",
+    limit,
+  });
+
+  return res.json({ communications });
+});
+
+app.post("/escalations/:id/claim", (req, res) => {
+  const escalation = getEscalationById(req.params.id);
+  if (!escalation) return res.status(404).json({ error: "escalation not found" });
+  if (escalation.status !== "pending") {
+    return res.status(409).json({ error: "escalation not pending", status: escalation.status });
+  }
+  const updated = updateEscalation(escalation.id, {
+    status: "claimed",
+    claimed_by: ESCALATION_CLAIMANT,
+  });
+  if (!updated) return res.status(500).json({ error: "failed to claim escalation" });
+  const refreshed = getEscalationById(escalation.id);
+  return res.json(refreshed ?? escalation);
+});
+
+app.post("/escalations/:id/resolve", (req, res) => {
+  const parsed = parseEscalationResolutionInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+  const escalation = getEscalationById(req.params.id);
+  if (!escalation) return res.status(404).json({ error: "escalation not found" });
+  if (escalation.status === "resolved") {
+    return res.status(409).json({ error: "escalation already resolved" });
+  }
+  if (
+    escalation.status !== "pending" &&
+    escalation.status !== "claimed" &&
+    escalation.status !== "escalated_to_user"
+  ) {
+    return res.status(409).json({ error: "escalation not resolvable", status: escalation.status });
+  }
+  const resolvedAt = new Date().toISOString();
+  const updated = updateEscalation(escalation.id, {
+    status: "resolved",
+    resolution: parsed.resolution,
+    resolved_at: resolvedAt,
+  });
+  if (!updated) return res.status(500).json({ error: "failed to resolve escalation" });
+  try {
+    createUserInteraction({
+      action_type: "escalation_resolved",
+      context: {
+        escalation_id: escalation.id,
+        project_id: escalation.project_id,
+        type: escalation.type,
+      },
+    });
+  } catch {
+    // Ignore interaction logging failures.
+  }
+  const refreshed = getEscalationById(escalation.id);
+  return res.json(refreshed ?? { ...escalation, status: "resolved", resolved_at: resolvedAt });
+});
+
+app.post("/escalations/:id/escalate-to-user", (req, res) => {
+  const escalation = getEscalationById(req.params.id);
+  if (!escalation) return res.status(404).json({ error: "escalation not found" });
+  if (escalation.status === "resolved") {
+    return res.status(409).json({ error: "escalation already resolved" });
+  }
+  if (escalation.status === "escalated_to_user") {
+    return res.json(escalation);
+  }
+
+  const active = getOpenEscalationForProject(escalation.project_id);
+  if (active && active.id !== escalation.id) {
+    return res.status(409).json({
+      error: "escalation already active for project",
+      debounced: true,
+      active_escalation_id: active.id,
+    });
+  }
+
+  if (NON_URGENT_ESCALATION_TYPES.has(escalation.type)) {
+    const preferences = getExplicitPreferences();
+    const deferral = getEscalationDeferral({
+      preferences,
+      lastEscalationAt: getLastEscalationAt(),
+    });
+    if (deferral) {
+      return res.json({
+        escalation,
+        deferred: true,
+        reason: deferral.reason,
+        retry_after_minutes: deferral.retry_after_minutes,
+      });
+    }
+  }
+
+  const updated = updateEscalation(escalation.id, {
+    status: "escalated_to_user",
+    claimed_by: escalation.claimed_by ?? ESCALATION_CLAIMANT,
+  });
+  if (!updated) {
+    return res.status(500).json({ error: "failed to escalate to user" });
+  }
+  const refreshed = getEscalationById(escalation.id);
+  return res.json(
+    refreshed ??
+      ({
+        ...escalation,
+        status: "escalated_to_user",
+        claimed_by: escalation.claimed_by ?? ESCALATION_CLAIMANT,
+      } as const)
+  );
+});
+
+app.post("/communications/:id/read", (req, res) => {
+  const communication = getProjectCommunicationById(req.params.id);
+  if (!communication) {
+    return res.status(404).json({ error: "communication not found" });
+  }
+  if (communication.intent === "escalation") {
+    return res.status(409).json({ error: "escalations use escalation endpoints" });
+  }
+  if (communication.read_at) {
+    return res.json(communication);
+  }
+  const readAt = new Date().toISOString();
+  const updated = updateProjectCommunication(communication.id, { read_at: readAt });
+  if (!updated) return res.status(500).json({ error: "failed to mark read" });
+  const refreshed = getProjectCommunicationById(communication.id);
+  return res.json(refreshed ?? { ...communication, read_at: readAt });
+});
+
+app.post("/communications/:id/acknowledge", (req, res) => {
+  const communication = getProjectCommunicationById(req.params.id);
+  if (!communication) {
+    return res.status(404).json({ error: "communication not found" });
+  }
+  if (communication.intent === "escalation") {
+    return res.status(409).json({ error: "escalations use escalation endpoints" });
+  }
+  if (communication.acknowledged_at) {
+    return res.json(communication);
+  }
+  const acknowledgedAt = new Date().toISOString();
+  const updated = updateProjectCommunication(communication.id, {
+    acknowledged_at: acknowledgedAt,
+    read_at: communication.read_at ?? acknowledgedAt,
+    status: "resolved",
+    resolved_at: acknowledgedAt,
+  });
+  if (!updated) return res.status(500).json({ error: "failed to acknowledge communication" });
+  const refreshed = getProjectCommunicationById(communication.id);
+  return res.json(
+    refreshed ?? {
+      ...communication,
+      acknowledged_at: acknowledgedAt,
+      read_at: communication.read_at ?? acknowledgedAt,
+      status: "resolved",
+      resolved_at: acknowledgedAt,
+    }
+  );
+});
+
+app.get("/projects/:id/shift-context", (req, res) => {
+  const context = buildShiftContext(req.params.id);
+  if (!context) return res.status(404).json({ error: "project not found" });
+  syncProjectBudgetAlerts({
+    projectId: context.project.id,
+    projectName: context.project.name,
+    projectPath: context.project.path,
+    readyWorkOrderIds: context.work_orders.ready.map((wo) => wo.id),
+  });
+  return res.json(context);
+});
+
+app.get("/projects/:id/autopilot", (req, res) => {
+  const snapshot = getAutopilotSnapshot(req.params.id);
+  if (!snapshot) return res.status(404).json({ error: "project not found" });
+  return res.json(snapshot);
+});
+
+app.put("/projects/:id/autopilot", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const parsed = parseAutopilotPolicyPatch(req.body ?? null);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+  const updated = updateAutopilotPolicyFromPatch(project.id, parsed.patch);
+  const snapshot = getAutopilotSnapshot(project.id);
+  return res.json(snapshot ?? { policy: updated });
+});
+
+app.get("/projects/:id/autopilot/candidates", (req, res) => {
+  const candidates = getAutopilotCandidates(req.params.id);
+  if (!candidates) return res.status(404).json({ error: "project not found" });
+  return res.json(candidates);
+});
+
+app.post("/projects/:id/work-orders/generate", async (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const payload = req.body ?? {};
+  const bodyProjectId =
+    typeof payload.project_id === "string" ? payload.project_id.trim() : "";
+  if (bodyProjectId && bodyProjectId !== id) {
+    return res.status(400).json({ error: "`project_id` does not match path" });
+  }
+
+  const descriptionRaw =
+    typeof payload.description === "string" ? payload.description.trim() : "";
+  if (!descriptionRaw) {
+    return res.status(400).json({ error: "`description` is required" });
+  }
+
+  const typeRaw = typeof payload.type === "string" ? payload.type.trim().toLowerCase() : "";
+  const allowedTypes = new Set(["feature", "bugfix", "refactor", "research"]);
+  if (typeRaw && !allowedTypes.has(typeRaw)) {
+    return res.status(400).json({
+      error: "`type` must be one of feature, bugfix, refactor, research",
+    });
+  }
+  const type = typeRaw ? (typeRaw as "feature" | "bugfix" | "refactor" | "research") : undefined;
+
+  let priority: number | null = null;
+  if (payload.priority !== undefined) {
+    const rawValue =
+      typeof payload.priority === "string" ? Number(payload.priority) : payload.priority;
+    if (typeof rawValue !== "number" || !Number.isFinite(rawValue)) {
+      return res.status(400).json({ error: "`priority` must be a number" });
+    }
+    const clamped = Math.min(5, Math.max(1, Math.trunc(rawValue)));
+    priority = clamped;
+  }
+
+  try {
+    const result = await generateWorkOrderDraft({
+      project,
+      description: descriptionRaw,
+      type,
+      priority,
+    });
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({
+      error: "failed to generate work order",
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+app.post("/projects/:id/work-orders/from-pattern", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const parsed = parseWorkOrderFromPatternInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+
+  const pattern = findGlobalPatternById(parsed.input.pattern_id);
+  if (!pattern) return res.status(404).json({ error: "pattern not found" });
+
+  let sourceWorkOrder: WorkOrder | null = null;
+  const sourceProject = findProjectById(pattern.source_project);
+  if (sourceProject) {
+    try {
+      sourceWorkOrder = getWorkOrder(sourceProject.path, pattern.source_wo);
+    } catch {
+      sourceWorkOrder = null;
+    }
+  }
+
+  const baseTitle = parsed.input.title || sourceWorkOrder?.title || pattern.name;
+  const baseTags = sourceWorkOrder?.tags?.length ? sourceWorkOrder.tags : pattern.tags;
+  const mergedTags = Array.from(new Set([...baseTags, ...pattern.tags]));
+  const basePriority = sourceWorkOrder?.priority ?? 3;
+  const baseEra = sourceWorkOrder?.era ?? undefined;
+  const baseBranch = sourceWorkOrder?.base_branch ?? undefined;
+
+  try {
+    const created = createWorkOrder(project.path, {
+      title: baseTitle,
+      priority: basePriority,
+      tags: mergedTags,
+      depends_on: [],
+      era: baseEra ?? undefined,
+      base_branch: baseBranch ?? undefined,
+    });
+
+    const context = [...(sourceWorkOrder?.context ?? [])];
+    context.push(`Adapted from pattern ${pattern.id} (${pattern.name}).`);
+    context.push(`Source project: ${pattern.source_project}.`);
+    context.push(`Source work order: ${pattern.source_wo}.`);
+    if (pattern.implementation_notes) {
+      context.push(`Implementation notes: ${pattern.implementation_notes}`);
+    }
+    if (pattern.success_metrics) {
+      context.push(`Success metrics: ${pattern.success_metrics}`);
+    }
+
+    const acceptanceCriteria =
+      sourceWorkOrder?.acceptance_criteria.length
+        ? sourceWorkOrder.acceptance_criteria
+        : pattern.success_metrics
+          ? [pattern.success_metrics]
+          : [];
+
+    const stopConditions =
+      sourceWorkOrder?.stop_conditions.length
+        ? sourceWorkOrder.stop_conditions
+        : ["Stop and ask for clarification if adaptation needs changes."];
+
+    const updated = patchWorkOrder(project.path, created.id, {
+      goal: sourceWorkOrder?.goal ?? pattern.description,
+      context,
+      acceptance_criteria: acceptanceCriteria,
+      non_goals: sourceWorkOrder?.non_goals ?? [],
+      stop_conditions: stopConditions,
+      estimate_hours: sourceWorkOrder?.estimate_hours ?? null,
+      depends_on: [],
+      status: "backlog",
+      tags: mergedTags,
+    });
+
+    const sourceSummary = sourceWorkOrder
+      ? {
+          project_id: sourceProject?.id ?? pattern.source_project,
+          work_order_id: sourceWorkOrder.id,
+          title: sourceWorkOrder.title,
+        }
+      : null;
+
+    return res.status(201).json({
+      work_order: updated,
+      pattern,
+      source_work_order: sourceSummary,
+    });
+  } catch (err) {
+    return sendWorkOrderError(res, err);
+  }
+});
+
+app.post("/projects/:id/shifts/spawn", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const parsed = parseStartShiftInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+
+  const agentType = parsed.input.agentType ?? "claude_cli";
+  if (agentType !== "claude_cli") {
+    return res.status(400).json({ error: "only claude_cli is supported" });
+  }
+  const agentId = parsed.input.agentId ?? "shift-agent";
+
+  const result = startShift({
+    projectId: project.id,
+    agentType,
+    agentId,
+    timeoutMinutes: parsed.input.timeoutMinutes,
+  });
+
+  if (!result.ok) {
+    return res.status(409).json({
+      error: "shift already active",
+      active_shift: result.activeShift,
+    });
+  }
+
+  const shift = result.shift;
+  try {
+    const spawned = spawnShiftAgent({
+      projectId: project.id,
+      projectPath: project.path,
+      shift,
+    });
+    return res.status(201).json({
+      shift,
+      pid: spawned.pid,
+      log_path: spawned.log_path,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "failed to spawn shift agent";
+    updateShift(shift.id, {
+      status: "failed",
+      completed_at: new Date().toISOString(),
+      error: message,
+    });
+    return res.status(500).json({ error: message });
+  }
+});
+
+app.post("/projects/:id/shifts", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const parsed = parseStartShiftInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+
+  const result = startShift({
+    projectId: project.id,
+    agentType: parsed.input.agentType,
+    agentId: parsed.input.agentId,
+    timeoutMinutes: parsed.input.timeoutMinutes,
+  });
+
+  if (!result.ok) {
+    return res.status(409).json({
+      error: "shift already active",
+      active_shift: result.activeShift,
+    });
+  }
+
+  const context = buildShiftContext(project.id);
+  if (!context) return res.status(500).json({ error: "failed to build shift context" });
+  return res.status(201).json({ shift: result.shift, context });
+});
+
+app.get("/projects/:id/shifts/active", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const shift = getActiveShift(project.id);
+  return res.json(shift ?? null);
+});
+
+app.get("/projects/:id/shifts", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit = Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 10;
+  const shifts = listShifts(project.id, limit);
+  return res.json(shifts);
+});
+
+app.get("/projects/:id/shifts/:shiftId/logs", (req, res) => {
+  const { id, shiftId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  if (!shiftId || !shiftId.trim()) {
+    return res.status(400).json({ error: "`shiftId` must be provided" });
+  }
+  const shift = getShiftByProjectId(project.id, shiftId);
+  if (!shift) return res.status(404).json({ error: "shift not found" });
+
+  const tailRaw = typeof req.query.tail === "string" ? Number(req.query.tail) : NaN;
+  const tail = Number.isFinite(tailRaw)
+    ? Math.max(1, Math.min(500, Math.trunc(tailRaw)))
+    : 100;
+  const log = tailShiftLog(project.path, shiftId, tail);
+  return res.json(log);
+});
+
+app.post("/projects/:id/shifts/:shiftId/complete", (req, res) => {
+  const { id, shiftId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  if (!shiftId || !shiftId.trim()) {
+    return res.status(400).json({ error: "`shiftId` must be provided" });
+  }
+
+  const parsed = parseCreateShiftHandoffInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+
+  expireStaleShifts(project.id);
+  const shift = getShiftByProjectId(project.id, shiftId);
+  if (!shift) return res.status(404).json({ error: "shift not found" });
+  if (shift.status !== "active") {
+    return res.status(409).json({ error: "shift not active", status: shift.status });
+  }
+
+  try {
+    const handoff = createShiftHandoff({
+      projectId: project.id,
+      shiftId,
+      input: parsed.input,
+    });
+    const completedAt = new Date().toISOString();
+    const updatedOk = updateShift(shift.id, {
+      status: "completed",
+      completed_at: completedAt,
+      handoff_id: handoff.id,
+      error: null,
+    });
+    if (!updatedOk) {
+      return res.status(500).json({ error: "failed to update shift" });
+    }
+    const updatedShift =
+      getShiftByProjectId(project.id, shiftId) ??
+      ({
+        ...shift,
+        status: "completed",
+        completed_at: completedAt,
+        handoff_id: handoff.id,
+        error: null,
+      } as const);
+    return res.json({ shift: updatedShift, handoff });
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "failed to complete shift",
+    });
+  }
+});
+
+app.post("/projects/:id/shifts/:shiftId/abandon", (req, res) => {
+  const { id, shiftId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  if (!shiftId || !shiftId.trim()) {
+    return res.status(400).json({ error: "`shiftId` must be provided" });
+  }
+
+  const parsed = parseAbandonShiftInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+
+  expireStaleShifts(project.id);
+  const shift = getShiftByProjectId(project.id, shiftId);
+  if (!shift) return res.status(404).json({ error: "shift not found" });
+  if (shift.status !== "active") {
+    return res.status(409).json({ error: "shift not active", status: shift.status });
+  }
+
+  const completedAt = new Date().toISOString();
+  const reason = parsed.reason ?? "Shift abandoned";
+  const updatedOk = updateShift(shift.id, {
+    status: "failed",
+    completed_at: completedAt,
+    error: reason,
+  });
+  if (!updatedOk) {
+    return res.status(500).json({ error: "failed to update shift" });
+  }
+
+  const updatedShift =
+    getShiftByProjectId(project.id, shiftId) ??
+    ({
+      ...shift,
+      status: "failed",
+      completed_at: completedAt,
+      error: reason,
+    } as const);
+  return res.json(updatedShift);
+});
+
+app.post("/projects/:id/shifts/:shiftId/handoff", (req, res) => {
+  const { id, shiftId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  if (!shiftId || !shiftId.trim()) {
+    return res.status(400).json({ error: "`shiftId` must be provided" });
+  }
+  const parsed = parseCreateShiftHandoffInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+  try {
+    const handoff = createShiftHandoff({
+      projectId: project.id,
+      shiftId,
+      input: parsed.input,
+    });
+    return res.status(201).json(handoff);
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "failed to create handoff",
+    });
+  }
+});
+
+app.patch("/repos/:id/star", (req, res) => {
+  const { id } = req.params;
+  const starred = req.body?.starred;
+  if (typeof starred !== "boolean") {
+    return res.status(400).json({ error: "`starred` must be boolean" });
+  }
+  const ok = setProjectStar(id, starred);
+  if (!ok) return res.status(404).json({ error: "project not found" });
+  return res.json({ ok: true, id, starred });
+});
+
+app.patch("/repos/:id/auto-shift", (req, res) => {
+  const { id } = req.params;
+  const enabled = req.body?.auto_shift_enabled;
+  if (typeof enabled !== "boolean") {
+    return res.status(400).json({ error: "`auto_shift_enabled` must be boolean" });
+  }
+  const project = updateProjectAutoShift(id, enabled);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  return res.json({
+    ok: true,
+    id,
+    auto_shift_enabled: project.auto_shift_enabled === 1,
+  });
+});
+
+app.put("/repos/:id/constitution", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const content = req.body?.content;
+  const statementsRaw = req.body?.statements;
+  const source =
+    typeof req.body?.source === "string" && req.body.source.trim()
+      ? req.body.source.trim()
+      : undefined;
+  if (typeof content !== "string" && !Array.isArray(statementsRaw)) {
+    return res.status(400).json({ error: "`content` must be string" });
+  }
+  if (Array.isArray(statementsRaw)) {
+    const invalid = statementsRaw.some((entry: unknown) => typeof entry !== "string");
+    if (invalid) {
+      return res.status(400).json({ error: "`statements` must be string array" });
+    }
+  }
+  const result = writeProjectConstitution(project.path, typeof content === "string" ? content : "", {
+    statements: Array.isArray(statementsRaw) ? statementsRaw : undefined,
+    source,
+  });
+  return res.json({ ok: true, version: result.version });
+});
+
+const CONSTITUTION_SUGGESTION_COOLDOWN_MS = 60 * 60 * 1000;
+const CONSTITUTION_SUGGESTION_MAX_SIGNALS = 24;
+const CONSTITUTION_SUGGESTION_MAX_SUGGESTIONS = 6;
+
+app.get("/repos/:id/constitution/suggestions", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const status = typeof req.query.status === "string" ? req.query.status.trim() : "";
+  if (status && status !== "pending" && status !== "accepted" && status !== "rejected") {
+    return res.status(400).json({ error: "`status` must be pending, accepted, or rejected" });
+  }
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.trunc(limitRaw)) : 50;
+  const suggestions = listConstitutionSuggestions({
+    project_id: project.id,
+    status: (status as "pending" | "accepted" | "rejected") || null,
+    limit,
+  });
+  return res.json({ suggestions });
+});
+
+app.post("/repos/:id/constitution/suggestions", async (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const lastCreatedAt = getLatestConstitutionSuggestionCreatedAt(project.id);
+  if (lastCreatedAt) {
+    const lastMs = Date.parse(lastCreatedAt);
+    if (Number.isFinite(lastMs)) {
+      const elapsed = Date.now() - lastMs;
+      if (elapsed < CONSTITUTION_SUGGESTION_COOLDOWN_MS) {
+        const retryAfterSeconds = Math.max(
+          1,
+          Math.ceil((CONSTITUTION_SUGGESTION_COOLDOWN_MS - elapsed) / 1000)
+        );
+        return res.status(429).json({
+          error: "rate limited",
+          retry_after_seconds: retryAfterSeconds,
+          next_allowed_at: new Date(lastMs + CONSTITUTION_SUGGESTION_COOLDOWN_MS).toISOString(),
+        });
+      }
+    }
+  }
+
+  const maxSignals =
+    typeof req.body?.maxSignals === "number" && Number.isFinite(req.body.maxSignals)
+      ? Math.max(1, Math.min(200, Math.trunc(req.body.maxSignals)))
+      : CONSTITUTION_SUGGESTION_MAX_SIGNALS;
+  const maxSuggestions =
+    typeof req.body?.maxSuggestions === "number" && Number.isFinite(req.body.maxSuggestions)
+      ? Math.max(1, Math.min(20, Math.trunc(req.body.maxSuggestions)))
+      : CONSTITUTION_SUGGESTION_MAX_SUGGESTIONS;
+
+  const signals = listSignals({ project_id: project.id, limit: maxSignals });
+  if (signals.length === 0) {
+    return res.status(400).json({ error: "no signals available" });
+  }
+
+  const constitution = mergeConstitutions(
+    readGlobalConstitution(),
+    readProjectConstitution(project.path)
+  );
+
+  try {
+    const result = await generateConstitutionSuggestions({
+      constitution,
+      signals: signals.map((signal) => ({
+        id: signal.id,
+        type: signal.type,
+        summary: signal.summary,
+        created_at: signal.created_at,
+      })),
+      projectName: project.name,
+      cwd: project.path,
+      maxSuggestions,
+    });
+
+    const signalMap = new Map(signals.map((signal) => [signal.id, signal]));
+    const suggestionsInput = result.suggestions
+      .map((suggestion) => {
+        const evidence = suggestion.evidence_ids
+          .map((signalId) => {
+            const signal = signalMap.get(signalId);
+            if (!signal) return null;
+            return {
+              id: signal.id,
+              type: signal.type,
+              summary: signal.summary,
+              created_at: signal.created_at,
+            };
+          })
+          .filter(Boolean);
+        if (!isInsightCategory(suggestion.category) || evidence.length === 0) return null;
+        return {
+          project_id: project.id,
+          scope: "project" as const,
+          category: suggestion.category,
+          text: suggestion.text,
+          evidence,
+        };
+      })
+      .filter((entry) => entry !== null) as Array<{
+      project_id: string;
+      scope: "project";
+      category: ConstitutionInsightCategory;
+      text: string;
+      evidence: {
+        id: string;
+        type: string;
+        summary: string;
+        created_at: string;
+      }[];
+    }>;
+
+    if (suggestionsInput.length === 0) {
+      return res.status(422).json({
+        error: "no usable suggestions generated",
+        warnings: result.warnings,
+      });
+    }
+
+    const suggestions = createConstitutionSuggestions(suggestionsInput);
+    return res.status(201).json({ suggestions, warnings: result.warnings });
+  } catch (err) {
+    return res.status(400).json({
+      error: err instanceof Error ? err.message : "failed to generate suggestions",
+    });
+  }
+});
+
+app.post("/repos/:id/constitution/suggestions/:suggestionId/accept", (req, res) => {
+  const { id, suggestionId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const suggestion = getConstitutionSuggestionById(suggestionId);
+  if (!suggestion || suggestion.project_id !== project.id) {
+    return res.status(404).json({ error: "suggestion not found" });
+  }
+  if (suggestion.status !== "pending") {
+    return res.status(409).json({ error: "suggestion already decided", status: suggestion.status });
+  }
+  if (!isInsightCategory(suggestion.category)) {
+    return res.status(400).json({ error: "suggestion category invalid" });
+  }
+
+  const actor =
+    typeof req.body?.actor === "string" && req.body.actor.trim()
+      ? req.body.actor.trim()
+      : "user";
+  const base =
+    suggestion.scope === "global"
+      ? readGlobalConstitution()
+      : readProjectConstitution(project.path) ?? "";
+  const updated = mergeConstitutionWithInsights({
+    base,
+    insights: [
+      {
+        category: suggestion.category,
+        text: suggestion.text,
+        scope: suggestion.scope,
+      },
+    ],
+  });
+
+  try {
+    const source = `suggestion:${suggestion.id}`;
+    const version =
+      suggestion.scope === "global"
+        ? writeGlobalConstitution(updated, { source }).version
+        : writeProjectConstitution(project.path, updated, { source }).version;
+    const decided = decideConstitutionSuggestion({
+      id: suggestion.id,
+      status: "accepted",
+      actor,
+    });
+    return res.json({ ok: true, suggestion: decided, version });
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "failed to apply suggestion",
+    });
+  }
+});
+
+app.post("/repos/:id/constitution/suggestions/:suggestionId/reject", (req, res) => {
+  const { id, suggestionId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const suggestion = getConstitutionSuggestionById(suggestionId);
+  if (!suggestion || suggestion.project_id !== project.id) {
+    return res.status(404).json({ error: "suggestion not found" });
+  }
+  if (suggestion.status !== "pending") {
+    return res.status(409).json({ error: "suggestion already decided", status: suggestion.status });
+  }
+  const actor =
+    typeof req.body?.actor === "string" && req.body.actor.trim()
+      ? req.body.actor.trim()
+      : "user";
+  const decided = decideConstitutionSuggestion({
+    id: suggestion.id,
+    status: "rejected",
+    actor,
+  });
+  return res.json({ ok: true, suggestion: decided });
+});
+
+function sendWorkOrderError(res: Response, err: unknown) {
+  if (!(err instanceof WorkOrderError)) {
+    return res.status(500).json({ error: "internal error" });
+  }
+  const status =
+    err.code === "not_found" ? 404 : err.code === "invalid" ? 400 : 500;
+  return res.status(status).json({ error: err.message, details: err.details });
+}
+
+type TrackCounts = {
+  workOrderCount: number;
+  doneCount: number;
+  readyCount: number;
+};
+
+const TRACK_STATUS_SET = new Set(["active", "paused", "completed"]);
+
+function buildTrackCounts(workOrders: WorkOrder[]): Map<string, TrackCounts> {
+  const counts = new Map<string, TrackCounts>();
+  for (const wo of workOrders) {
+    const ids = wo.trackIds.length > 0 ? wo.trackIds : wo.trackId ? [wo.trackId] : [];
+    for (const trackId of ids) {
+      const entry = counts.get(trackId) ?? {
+        workOrderCount: 0,
+        doneCount: 0,
+        readyCount: 0,
+      };
+      entry.workOrderCount += 1;
+      if (wo.status === "done") entry.doneCount += 1;
+      if (wo.status === "ready") entry.readyCount += 1;
+      counts.set(trackId, entry);
+    }
+  }
+  return counts;
+}
+
+function applyTrackCounts(track: Track, counts: Map<string, TrackCounts>): Track {
+  const entry = counts.get(track.id);
+  if (!entry) return track;
+  return { ...track, ...entry };
+}
+
+function normalizeOptionalText(value: string): string | null {
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+app.get("/repos/:id/work-orders", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const workOrders = listWorkOrders(project.path);
+  const dependencyLookups = buildDependencyLookups(project, workOrders);
+  const workOrdersWithDeps = workOrders.map((wo) => {
+    const resolved = resolveWorkOrderDependencies(wo, project.id, dependencyLookups);
+    const summary = summarizeResolvedDependencies(resolved);
+    return {
+      ...wo,
+      resolved_dependencies: resolved,
+      blocked_by_cross_project: summary.blockedByCrossProject,
+      deps_satisfied: summary.depsSatisfied,
+    };
+  });
+  return res.json({
+    project: { id: project.id, name: project.name, path: project.path },
+    work_orders: workOrdersWithDeps,
+  });
+});
+
+app.get("/repos/:id/work-orders/:workOrderId", (req, res) => {
+  const { id, workOrderId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  try {
+    const workOrders = listWorkOrders(project.path);
+    const workOrder = workOrders.find((wo) => wo.id === workOrderId);
+    if (!workOrder) {
+      throw new WorkOrderError("Work Order not found", "not_found");
+    }
+    const dependencyLookups = buildDependencyLookups(project, workOrders);
+    const resolved = resolveWorkOrderDependencies(workOrder, project.id, dependencyLookups);
+    const summary = summarizeResolvedDependencies(resolved);
+    const markdown = readWorkOrderMarkdown(project.path, workOrderId);
+    return res.json({
+      project: { id: project.id, name: project.name, path: project.path },
+      work_order: {
+        ...workOrder,
+        resolved_dependencies: resolved,
+        blocked_by_cross_project: summary.blockedByCrossProject,
+        deps_satisfied: summary.depsSatisfied,
+      },
+      markdown,
+    });
+  } catch (err) {
+    return sendWorkOrderError(res, err);
+  }
+});
+
+app.post("/repos/:id/work-orders", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  try {
+    const workOrder = createWorkOrder(project.path, req.body ?? {});
+    return res.status(201).json(workOrder);
+  } catch (err) {
+    return sendWorkOrderError(res, err);
+  }
+});
+
+app.patch("/repos/:id/work-orders/:workOrderId", (req, res) => {
+  const { id, workOrderId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  try {
+    const before = getWorkOrder(project.path, workOrderId);
+    const updated = patchWorkOrder(project.path, workOrderId, req.body ?? {});
+    if (before.status !== "done" && updated.status === "done") {
+      markWorkOrderRunsMerged(project.id, workOrderId);
+    }
+
+    // If work order was marked as done, trigger auto-ready cascade
+    if (updated.status === "done") {
+      // First sync dependencies to ensure the database is up to date
+      const allWorkOrders = listWorkOrders(project.path);
+      for (const wo of allWorkOrders) {
+        syncWorkOrderDeps(id, wo.id, wo.depends_on);
+      }
+
+      // Run cascade
+      const cascaded = cascadeAutoReady(project.path, workOrderId, (woId) =>
+        getWorkOrderDependents(id, woId)
+      );
+
+      if (cascaded.length > 0) {
+        return res.json({ ...updated, cascaded_to_ready: cascaded });
+      }
+    }
+
+    return res.json(updated);
+  } catch (err) {
+    return sendWorkOrderError(res, err);
+  }
+});
+
+app.get("/repos/:id/tracks", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const workOrders = listWorkOrders(project.path);
+  const counts = buildTrackCounts(workOrders);
+  const tracks = listTracks(project.id).map((track) => applyTrackCounts(track, counts));
+  return res.json({ tracks });
+});
+
+app.post("/repos/:id/tracks", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const payload = req.body ?? {};
+  const nameValue = payload.name;
+  if (typeof nameValue !== "string" || !nameValue.trim()) {
+    return res.status(400).json({ error: "`name` is required" });
+  }
+
+  const descriptionValue = payload.description;
+  if (
+    descriptionValue !== undefined &&
+    descriptionValue !== null &&
+    typeof descriptionValue !== "string"
+  ) {
+    return res.status(400).json({ error: "`description` must be a string" });
+  }
+  const goalValue = payload.goal;
+  if (goalValue !== undefined && goalValue !== null && typeof goalValue !== "string") {
+    return res.status(400).json({ error: "`goal` must be a string" });
+  }
+  const statusValue = payload.status;
+  if (statusValue !== undefined && statusValue !== null && typeof statusValue !== "string") {
+    return res.status(400).json({ error: "`status` must be a string" });
+  }
+  if (typeof statusValue === "string" && !TRACK_STATUS_SET.has(statusValue)) {
+    return res.status(400).json({ error: "`status` must be active, paused, or completed" });
+  }
+  const parentTrackValue = payload.parentTrackId ?? payload.parent_track_id;
+  if (
+    parentTrackValue !== undefined &&
+    parentTrackValue !== null &&
+    typeof parentTrackValue !== "string"
+  ) {
+    return res.status(400).json({ error: "`parentTrackId` must be a string" });
+  }
+  const parentTrackId =
+    typeof parentTrackValue === "string" ? normalizeOptionalText(parentTrackValue) : null;
+  if (parentTrackId) {
+    const parent = getTrackById(project.id, parentTrackId);
+    if (!parent) {
+      return res.status(400).json({ error: "parent track not found" });
+    }
+  }
+  const colorValue = payload.color;
+  if (colorValue !== undefined && colorValue !== null && typeof colorValue !== "string") {
+    return res.status(400).json({ error: "`color` must be a string" });
+  }
+  const iconValue = payload.icon;
+  if (iconValue !== undefined && iconValue !== null && typeof iconValue !== "string") {
+    return res.status(400).json({ error: "`icon` must be a string" });
+  }
+  const sortOrderValue = payload.sortOrder;
+  if (
+    sortOrderValue !== undefined &&
+    (typeof sortOrderValue !== "number" || !Number.isFinite(sortOrderValue))
+  ) {
+    return res.status(400).json({ error: "`sortOrder` must be a number" });
+  }
+
+  const track = createTrack({
+    project_id: project.id,
+    name: nameValue.trim(),
+    description:
+      typeof descriptionValue === "string"
+        ? normalizeOptionalText(descriptionValue)
+        : null,
+    goal: typeof goalValue === "string" ? normalizeOptionalText(goalValue) : null,
+    status: typeof statusValue === "string" ? (statusValue as "active" | "paused" | "completed") : undefined,
+    parent_track_id: parentTrackId,
+    color: typeof colorValue === "string" ? normalizeOptionalText(colorValue) : null,
+    icon: typeof iconValue === "string" ? normalizeOptionalText(iconValue) : null,
+    sort_order:
+      typeof sortOrderValue === "number" ? Math.trunc(sortOrderValue) : undefined,
+  });
+
+  return res.status(201).json({ track });
+});
+
+app.get("/repos/:id/tracks/:trackId", (req, res) => {
+  const { id, trackId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const track = getTrackById(project.id, trackId);
+  if (!track) return res.status(404).json({ error: "track not found" });
+
+  const workOrders = listWorkOrders(project.path).filter(
+    (wo) => wo.trackIds.includes(trackId) || wo.trackId === trackId
+  );
+  const counts: TrackCounts = {
+    workOrderCount: workOrders.length,
+    doneCount: workOrders.filter((wo) => wo.status === "done").length,
+    readyCount: workOrders.filter((wo) => wo.status === "ready").length,
+  };
+
+  return res.json({ track: { ...track, ...counts }, workOrders });
+});
+
+app.put("/repos/:id/tracks/:trackId", (req, res) => {
+  const { id, trackId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const payload = req.body ?? {};
+  const patch: {
+    name?: string;
+    description?: string | null;
+    goal?: string | null;
+    status?: "active" | "paused" | "completed";
+    parentTrackId?: string | null;
+    color?: string | null;
+    icon?: string | null;
+    sortOrder?: number;
+  } = {};
+
+  if ("name" in payload) {
+    if (typeof payload.name !== "string" || !payload.name.trim()) {
+      return res.status(400).json({ error: "`name` must be a non-empty string" });
+    }
+    patch.name = payload.name.trim();
+  }
+  if ("description" in payload) {
+    if (payload.description === null) {
+      patch.description = null;
+    } else if (typeof payload.description === "string") {
+      patch.description = normalizeOptionalText(payload.description);
+    } else {
+      return res.status(400).json({ error: "`description` must be a string or null" });
+    }
+  }
+  if ("goal" in payload) {
+    if (payload.goal === null) {
+      patch.goal = null;
+    } else if (typeof payload.goal === "string") {
+      patch.goal = normalizeOptionalText(payload.goal);
+    } else {
+      return res.status(400).json({ error: "`goal` must be a string or null" });
+    }
+  }
+  if ("status" in payload) {
+    if (payload.status === null) {
+      return res.status(400).json({ error: "`status` cannot be null" });
+    }
+    if (typeof payload.status !== "string" || !TRACK_STATUS_SET.has(payload.status)) {
+      return res.status(400).json({ error: "`status` must be active, paused, or completed" });
+    }
+    patch.status = payload.status as "active" | "paused" | "completed";
+  }
+  if ("parentTrackId" in payload || "parent_track_id" in payload) {
+    const rawParent = payload.parentTrackId ?? payload.parent_track_id;
+    if (rawParent === null) {
+      patch.parentTrackId = null;
+    } else if (typeof rawParent === "string") {
+      patch.parentTrackId = normalizeOptionalText(rawParent);
+    } else {
+      return res.status(400).json({ error: "`parentTrackId` must be a string or null" });
+    }
+  }
+  if ("color" in payload) {
+    if (payload.color === null) {
+      patch.color = null;
+    } else if (typeof payload.color === "string") {
+      patch.color = normalizeOptionalText(payload.color);
+    } else {
+      return res.status(400).json({ error: "`color` must be a string or null" });
+    }
+  }
+  if ("icon" in payload) {
+    if (payload.icon === null) {
+      patch.icon = null;
+    } else if (typeof payload.icon === "string") {
+      patch.icon = normalizeOptionalText(payload.icon);
+    } else {
+      return res.status(400).json({ error: "`icon` must be a string or null" });
+    }
+  }
+  if ("sortOrder" in payload) {
+    if (
+      typeof payload.sortOrder !== "number" ||
+      !Number.isFinite(payload.sortOrder)
+    ) {
+      return res.status(400).json({ error: "`sortOrder` must be a number" });
+    }
+    patch.sortOrder = Math.trunc(payload.sortOrder);
+  }
+
+  if (!Object.keys(patch).length) {
+    return res.status(400).json({ error: "No valid fields to update" });
+  }
+
+  if (patch.parentTrackId) {
+    if (patch.parentTrackId === trackId) {
+      return res.status(400).json({ error: "parent track cannot be the track itself" });
+    }
+    const parent = getTrackById(project.id, patch.parentTrackId);
+    if (!parent) {
+      return res.status(400).json({ error: "parent track not found" });
+    }
+  }
+
+  const track = updateTrack(project.id, trackId, patch);
+  if (!track) return res.status(404).json({ error: "track not found" });
+  return res.json({ track });
+});
+
+app.delete("/repos/:id/tracks/:trackId", (req, res) => {
+  const { id, trackId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const deleted = deleteTrack(project.id, trackId);
+  if (!deleted) return res.status(404).json({ error: "track not found" });
+  return res.json({ ok: true });
+});
+
+app.post("/repos/:id/tracks/organize", async (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const mode = req.body?.mode;
+  try {
+    const result = await generateTrackOrganizationSuggestions({
+      projectId: project.id,
+      mode,
+    });
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "failed to generate track suggestions",
+    });
+  }
+});
+
+app.post("/repos/:id/tracks/organize/apply", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const mode = req.body?.mode;
+  const suggestions = req.body?.suggestions;
+  if (!suggestions || typeof suggestions !== "object") {
+    return res.status(400).json({ error: "`suggestions` is required" });
+  }
+  const modeValue = typeof mode === "string" ? mode : "";
+  const normalizedMode =
+    modeValue === "initial" || modeValue === "incremental" || modeValue === "reorg"
+      ? modeValue
+      : "incremental";
+
+  try {
+    const result = applyTrackOrganizationSuggestions({
+      projectId: project.id,
+      mode: normalizedMode,
+      suggestions,
+    });
+    return res.json(result);
+  } catch (err) {
+    return res
+      .status(500)
+      .json({ error: err instanceof Error ? err.message : "failed to apply track suggestions" });
+  }
+});
+
+app.get("/repos/:id/tech-tree", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const workOrders = listWorkOrders(project.path);
+  const dependencyLookups = buildDependencyLookups(project, workOrders);
+
+  // Sync dependencies from file frontmatter to database
+  for (const wo of workOrders) {
+    syncWorkOrderDeps(id, wo.id, wo.depends_on);
+  }
+
+  const deps = listAllWorkOrderDeps(id);
+
+  // Build dependents map (reverse lookup)
+  const dependentsMap = new Map<string, string[]>();
+  for (const dep of deps) {
+    const list = dependentsMap.get(dep.depends_on_id) ?? [];
+    list.push(dep.work_order_id);
+    dependentsMap.set(dep.depends_on_id, list);
+  }
+
+  type DependencyNode = {
+    id: string;
+    title: string;
+    status: string;
+    priority: number;
+    era: string | null;
+    updatedAt: string | null;
+    dependsOn: string[];
+    dependents: string[];
+    trackId: string | null;
+    track: { id: string; name: string; color: string | null } | null;
+    trackIds: string[];
+    tracks: { id: string; name: string; color: string | null }[];
+    projectId: string;
+    projectName: string;
+    isExternal: boolean;
+  };
+
+  const normalizedDependsOn = new Map<string, string[]>();
+  const externalNodes = new Map<string, DependencyNode>();
+
+  for (const wo of workOrders) {
+    const normalized = wo.depends_on
+      .map((dep) => normalizeDependencyId(dep, project.id))
+      .filter(Boolean);
+    normalizedDependsOn.set(wo.id, normalized);
+
+    for (const dep of wo.depends_on) {
+      const parsed = parseDependencyRef(dep, project.id);
+      if (!parsed.isCrossProject) continue;
+      const nodeId = normalizeDependencyId(dep, project.id);
+      if (!nodeId || externalNodes.has(nodeId)) continue;
+      const lookup = dependencyLookups.get(parsed.projectId);
+      const depWorkOrder = lookup?.byId.get(parsed.workOrderId) ?? null;
+      externalNodes.set(nodeId, {
+        id: nodeId,
+        title: depWorkOrder?.title ?? parsed.workOrderId,
+        status: depWorkOrder?.status ?? "blocked",
+        priority: depWorkOrder?.priority ?? 3,
+        era: depWorkOrder?.era ?? null,
+        updatedAt: depWorkOrder?.updated_at ?? null,
+        dependsOn: [],
+        dependents: [],
+        trackId: null,
+        track: null,
+        trackIds: [],
+        tracks: [],
+        projectId: parsed.projectId,
+        projectName: lookup?.project.name ?? parsed.projectId,
+        isExternal: true,
+      });
+    }
+  }
+
+  // Detect cycles using DFS with white/gray/black coloring
+  type Color = "white" | "gray" | "black";
+  const color = new Map<string, Color>();
+  const cycles: string[][] = [];
+
+  function dfs(nodeId: string, path: string[]): void {
+    const c = color.get(nodeId) ?? "white";
+    if (c === "black") return;
+    if (c === "gray") {
+      // Found a cycle
+      const cycleStart = path.indexOf(nodeId);
+      if (cycleStart >= 0) {
+        cycles.push(path.slice(cycleStart).concat(nodeId));
+      }
+      return;
+    }
+    color.set(nodeId, "gray");
+    const depsForNode = normalizedDependsOn.get(nodeId) ?? [];
+    for (const depId of depsForNode) {
+      dfs(depId, [...path, nodeId]);
+    }
+    color.set(nodeId, "black");
+  }
+
+  for (const wo of workOrders) {
+    if ((color.get(wo.id) ?? "white") === "white") {
+      dfs(wo.id, []);
+    }
+  }
+
+  const localNodes: DependencyNode[] = workOrders.map((wo) => ({
+    id: wo.id,
+    title: wo.title,
+    status: wo.status,
+    priority: wo.priority,
+    era: wo.era,
+    updatedAt: wo.updated_at,
+    dependsOn: normalizedDependsOn.get(wo.id) ?? [],
+    dependents: dependentsMap.get(wo.id) ?? [],
+    trackId: wo.trackId,
+    track: wo.track,
+    trackIds: wo.trackIds,
+    tracks: wo.tracks,
+    projectId: project.id,
+    projectName: project.name,
+    isExternal: false,
+  }));
+
+  const externalNodesList = Array.from(externalNodes.values()).map((node) => ({
+    ...node,
+    dependents: dependentsMap.get(node.id) ?? [],
+  }));
+
+  const nodes: DependencyNode[] = [...localNodes, ...externalNodesList];
+
+  // Collect unique eras
+  const erasSet = new Set<string>();
+  for (const wo of workOrders) {
+    if (wo.era) erasSet.add(wo.era);
+  }
+  const eras = Array.from(erasSet).sort();
+  const tracks = listTracks(project.id).map((track) => ({
+    id: track.id,
+    name: track.name,
+    color: track.color,
+    sortOrder: track.sortOrder,
+  }));
+
+  return res.json({ nodes, cycles, eras, tracks });
+});
+
+const ESTIMATION_SCOPES = ["project", "global"] as const;
+const ESTIMATION_SCOPE_SET = new Set<string>(ESTIMATION_SCOPES);
+const DEFAULT_ESTIMATION_CONTEXT_LIMIT = 5;
+const MAX_ESTIMATION_CONTEXT_LIMIT = 50;
+const ESTIMATION_CONTEXT_FETCH_MULTIPLIER = 5;
+
+type WorkOrderMeta = {
+  title: string | null;
+  tags: string[];
+  estimate_hours: number | null;
+};
+
+type EstimationContextRun = {
+  wo_id: string;
+  wo_title: string;
+  wo_tags: string[];
+  wo_estimate_hours: number;
+  iterations: number;
+  total_seconds: number;
+  outcome: "approved" | "failed";
+  created_at: string;
+};
+
+function parseWorkOrderFrontmatter(markdown: string): Record<string, unknown> | null {
+  if (!markdown.startsWith("---")) return null;
+  const lines = markdown.split(/\r?\n/);
+  if (lines.length < 3) return null;
+  let endIdx = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].trim() === "---") {
+      endIdx = i;
+      break;
+    }
+  }
+  if (endIdx === -1) return null;
+  const yamlText = lines.slice(1, endIdx).join("\n");
+  try {
+    const parsed = YAML.parse(yamlText);
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function extractWorkOrderMeta(markdown: string): WorkOrderMeta {
+  const frontmatter = parseWorkOrderFrontmatter(markdown);
+  if (!frontmatter) {
+    return { title: null, tags: [], estimate_hours: null };
+  }
+  const title = typeof frontmatter.title === "string" ? frontmatter.title.trim() : null;
+  const tags = normalizeStringArrayField(frontmatter.tags) ?? [];
+  const estimate_hours =
+    typeof frontmatter.estimate_hours === "number" &&
+    Number.isFinite(frontmatter.estimate_hours)
+      ? frontmatter.estimate_hours
+      : null;
+  return { title, tags, estimate_hours };
+}
+
+function loadWorkOrderMeta(projectPath: string, workOrderId: string): WorkOrderMeta | null {
+  try {
+    return extractWorkOrderMeta(readWorkOrderMarkdown(projectPath, workOrderId));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeEstimateHours(value: number | null): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  return Math.max(0, value);
+}
+
+function parseEstimationLimit(value: unknown): number {
+  const raw = typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_ESTIMATION_CONTEXT_LIMIT;
+  return Math.min(MAX_ESTIMATION_CONTEXT_LIMIT, Math.trunc(raw));
+}
+
+function countTagOverlap(tags: string[], targetTags: Set<string>): number {
+  if (!tags.length || targetTags.size === 0) return 0;
+  const seen = new Set<string>();
+  let count = 0;
+  for (const tag of tags) {
+    const normalized = tag.trim().toLowerCase();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    if (targetTags.has(normalized)) count += 1;
+  }
+  return count;
+}
+
+function sortRunsBySimilarity(
+  runs: EstimationContextRun[],
+  targetTags: string[]
+): EstimationContextRun[] {
+  const sortedByRecency = [...runs].sort((a, b) => b.created_at.localeCompare(a.created_at));
+  if (!targetTags.length) return sortedByRecency;
+  const targetSet = new Set(
+    targetTags.map((tag) => tag.trim().toLowerCase()).filter(Boolean)
+  );
+  if (!targetSet.size) return sortedByRecency;
+  const scored = sortedByRecency.map((run) => ({
+    run,
+    overlap: countTagOverlap(run.wo_tags, targetSet),
+  }));
+  const filtered = scored.filter((entry) => entry.overlap > 0);
+  const base = filtered.length ? filtered : scored;
+  return base
+    .sort((a, b) => {
+      if (a.overlap !== b.overlap) return b.overlap - a.overlap;
+      return b.run.created_at.localeCompare(a.run.created_at);
+    })
+    .map((entry) => entry.run);
+}
+
+function resolveRunOutcome(status: string, reviewerVerdict: string | null): "approved" | "failed" {
+  if (
+    status === "baseline_failed" ||
+    status === "merge_conflict" ||
+    status === "failed" ||
+    status === "rejected"
+  ) {
+    return "failed";
+  }
+  if (
+    status === "merged" ||
+    status === "you_review" ||
+    status === "approved" ||
+    status === "pr_open"
+  ) {
+    return "approved";
+  }
+  if (reviewerVerdict === "approved") return "approved";
+  return "failed";
+}
+
+app.get("/repos/:id/runs", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : 50;
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.trunc(limitRaw)) : 50;
+  return res.json({ runs: getRunsForProject(project.id, limit) });
+});
+
+app.get("/repos/:id/signals", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  const workOrderId =
+    typeof req.query.work_order_id === "string" ? req.query.work_order_id.trim() : "";
+  const runId = typeof req.query.run_id === "string" ? req.query.run_id.trim() : "";
+  const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : NaN;
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(200, Math.trunc(limitRaw)) : 50;
+  const signals = listSignals({
+    project_id: project.id,
+    work_order_id: workOrderId || null,
+    run_id: runId || null,
+    limit,
+  });
+  return res.json({ signals });
+});
+
+app.post("/repos/:id/signals", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const body = req.body as Record<string, unknown> | null;
+  if (!body || typeof body !== "object") {
+    return res.status(400).json({ error: "request body required" });
+  }
+
+  const type = typeof body.type === "string" ? body.type.trim() : "";
+  const summary = typeof body.summary === "string" ? body.summary.trim() : "";
+  const source = typeof body.source === "string" ? body.source.trim() : "user";
+  const workOrderId =
+    typeof body.work_order_id === "string" ? body.work_order_id.trim() : "";
+  const runId = typeof body.run_id === "string" ? body.run_id.trim() : "";
+
+  const tagsInput = body.tags;
+  const tags =
+    Array.isArray(tagsInput)
+      ? tagsInput.filter((tag): tag is string => typeof tag === "string").map((tag) => tag.trim()).filter(Boolean)
+      : typeof tagsInput === "string"
+        ? tagsInput
+            .split(",")
+            .map((tag) => tag.trim())
+            .filter(Boolean)
+        : [];
+
+  if (!type) return res.status(400).json({ error: "`type` is required" });
+  if (!summary) return res.status(400).json({ error: "`summary` is required" });
+  if (!source) return res.status(400).json({ error: "`source` is required" });
+
+  if (runId) {
+    const run = getRunById(runId);
+    if (!run) return res.status(400).json({ error: "run not found" });
+    if (run.project_id !== project.id) {
+      return res.status(400).json({ error: "run does not belong to project" });
+    }
+  }
+
+  try {
+    const signal = createSignal({
+      project_id: project.id,
+      work_order_id: workOrderId || null,
+      run_id: runId || null,
+      type,
+      summary,
+      tags,
+      source,
+    });
+    return res.status(201).json(signal);
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "failed to create signal",
+    });
+  }
+});
+
+app.get("/repos/:id/run-metrics/summary", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+  return res.json(getRunPhaseMetricsSummary(project.id));
+});
+
+app.get("/repos/:id/estimation-context", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const rawScope = typeof req.query.scope === "string" ? req.query.scope.trim() : "";
+  if (rawScope && !ESTIMATION_SCOPE_SET.has(rawScope)) {
+    return res.status(400).json({ error: "`scope` must be global or project" });
+  }
+  const scope = rawScope === "global" ? "global" : "project";
+  const limit = parseEstimationLimit(req.query.limit);
+  const fetchLimit = Math.min(
+    200,
+    Math.max(limit * ESTIMATION_CONTEXT_FETCH_MULTIPLIER, limit)
+  );
+  const woId = typeof req.query.wo_id === "string" ? req.query.wo_id.trim() : "";
+
+  let targetTags: string[] = [];
+  if (woId) {
+    const targetMeta = loadWorkOrderMeta(project.path, woId);
+    if (!targetMeta) return res.status(404).json({ error: "work order not found" });
+    targetTags = targetMeta.tags;
+  }
+
+  const summary = getEstimationContextSummary(scope === "global" ? null : project.id);
+  const recentRuns = listEstimationContextRuns(
+    scope === "global" ? null : project.id,
+    fetchLimit
+  );
+
+  const projectMap = new Map<string, ProjectRow>();
+  if (scope === "global") {
+    for (const entry of listProjects()) {
+      projectMap.set(entry.id, entry);
+    }
+  }
+
+  const resolvedRuns = recentRuns.map((run) => {
+    const projectPath =
+      scope === "global" ? projectMap.get(run.project_id)?.path ?? null : project.path;
+    const meta = projectPath ? loadWorkOrderMeta(projectPath, run.work_order_id) : null;
+    const woTags = meta?.tags.length ? meta.tags : run.work_order_tags;
+    const woTitle = meta?.title?.trim() || run.work_order_title || run.work_order_id;
+    const woEstimateHours = normalizeEstimateHours(meta?.estimate_hours ?? null);
+    return {
+      wo_id: run.work_order_id,
+      wo_title: woTitle,
+      wo_tags: woTags,
+      wo_estimate_hours: woEstimateHours,
+      iterations: run.iterations,
+      total_seconds: run.total_seconds,
+      outcome: resolveRunOutcome(run.status, run.reviewer_verdict),
+      created_at: run.created_at,
+    };
+  });
+
+  const recentSorted = sortRunsBySimilarity(resolvedRuns, targetTags)
+    .slice(0, limit)
+    .map(({ created_at, ...rest }) => rest);
+
+  return res.json({
+    averages: summary.averages,
+    recent_runs: recentSorted,
+    sample_size: summary.sample_size,
+  });
+});
+
+app.post("/repos/:id/runs/cleanup-merged", (req, res) => {
+  const { id } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  const workOrders = listWorkOrders(project.path);
+  const doneWorkOrders = workOrders.filter((wo) => wo.status === "done");
+  let updatedRuns = 0;
+  for (const workOrder of doneWorkOrders) {
+    updatedRuns += markWorkOrderRunsMerged(project.id, workOrder.id);
+  }
+
+  return res.json({
+    ok: true,
+    work_orders: doneWorkOrders.length,
+    updated_runs: updatedRuns,
+  });
+});
+
+app.post("/repos/:id/work-orders/:workOrderId/runs", (req, res) => {
+  const { id, workOrderId } = req.params;
+  const project = findProjectById(id);
+  if (!project) return res.status(404).json({ error: "project not found" });
+
+  try {
+    const sourceBranch =
+      typeof req.body?.source_branch === "string" ? req.body.source_branch.trim() : "";
+    const run = enqueueCodexRun(project.id, workOrderId, sourceBranch || null, "manual");
+    return res.status(201).json(run);
+  } catch (err) {
+    if (err instanceof BudgetEnforcementError) {
+      return res.status(409).json({
+        error: err.message,
+        code: err.code,
+        details: err.details,
+      });
+    }
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.get("/runs/:runId", (req, res) => {
+  const run = getRun(req.params.runId);
+  if (!run) return res.status(404).json({ error: "run not found" });
+  return res.json(run);
+});
+
+app.get("/runs/:runId/logs/tail", (req, res) => {
+  const linesRaw = typeof req.query.lines === "string" ? Number(req.query.lines) : NaN;
+  const lines = Number.isFinite(linesRaw)
+    ? Math.max(1, Math.min(500, Math.trunc(linesRaw)))
+    : 50;
+  const tail = tailRunLog(req.params.runId, lines);
+  if (!tail) return res.status(404).json({ error: "run not found" });
+  return res.json(tail);
+});
+
+app.get("/runs/:runId/metrics", (req, res) => {
+  const runId = req.params.runId;
+  const run = getRunById(runId);
+  if (!run) return res.status(404).json({ error: "run not found" });
+  return res.json(listRunPhaseMetrics(runId));
+});
+
+app.post("/runs/:runId/cancel", async (req, res) => {
+  try {
+    const result = await cancelRun(req.params.runId);
+    if (!result.ok) {
+      const status =
+        result.code === "not_found" ? 404 : result.code === "not_cancelable" ? 400 : 500;
+      return res.status(status).json({ error: result.error });
+    }
+    return res.json(result.run);
+  } catch (err) {
+    return res.status(500).json({
+      error: err instanceof Error ? err.message : "cancel failed",
+    });
+  }
+});
+
+app.post("/runs/:runId/resume", (req, res) => {
+  const result = resumeRun(req.params.runId);
+  if (!result.ok) {
+    const status =
+      result.code === "not_found"
+        ? 404
+        : result.code === "active_run_exists"
+          ? 409
+          : 400;
+    return res.status(status).json({ error: result.error, code: result.code });
+  }
+  return res.json(result.run);
+});
+
+app.post("/runs/:runId/approve-merge", (req, res) => {
+  const result = approveRunMerge(req.params.runId);
+  if (!result.ok) {
+    const status =
+      result.code === "not_found"
+        ? 404
+        : result.code === "invalid_status"
+          ? 400
+          : result.code === "merge_conflict" || result.code === "merge_lock_busy"
+            ? 409
+            : 500;
+    return res.status(status).json({ error: result.error, code: result.code });
+  }
+  return res.json(result.run);
+});
+
+app.post("/runs/:runId/reject", (req, res) => {
+  const result = rejectRun(req.params.runId);
+  if (!result.ok) {
+    const status =
+      result.code === "not_found"
+        ? 404
+        : result.code === "invalid_status"
+          ? 400
+          : 500;
+    return res.status(status).json({ error: result.error, code: result.code });
+  }
+  return res.json(result.run);
+});
+
+app.post("/runs/:runId/security-hold/resume", (req, res) => {
+  const result = resumeSecurityHoldRun(req.params.runId);
+  if (!result.ok) {
+    const status =
+      result.code === "not_found" ? 404 : result.code === "invalid_status" ? 400 : 500;
+    return res.status(status).json({ error: result.error });
+  }
+  return res.json(result.run);
+});
+
+app.post("/runs/:runId/security-hold/abort", (req, res) => {
+  const result = abortSecurityHoldRun(req.params.runId);
+  if (!result.ok) {
+    const status =
+      result.code === "not_found" ? 404 : result.code === "invalid_status" ? 400 : 500;
+    return res.status(status).json({ error: result.error });
+  }
+  return res.json(result.run);
+});
+
+// PATCH endpoint for updating run status (for cleaning up stale states)
+app.patch("/runs/:runId", (req, res) => {
+  const run = getRunById(req.params.runId);
+  if (!run) return res.status(404).json({ error: "run not found" });
+
+  const body = req.body as Record<string, unknown> | null;
+  if (!body || typeof body !== "object") {
+    return res.status(400).json({ error: "request body required" });
+  }
+
+  const validStatuses = [
+    "queued",
+    "baseline_failed",
+    "building",
+    "waiting_for_input",
+    "security_hold",
+    "ai_review",
+    "testing",
+    "approved",
+    "pr_open",
+    "you_review",
+    "merged",
+    "merge_conflict",
+    "rejected",
+    "failed",
+    "canceled",
+    "superseded",
+  ] as const;
+  const validMergeStatuses = ["pending", "merged", "conflict"] as const;
+
+  type RunPatch = Parameters<typeof updateRun>[1];
+  const patch: RunPatch = {};
+
+  if ("status" in body && typeof body.status === "string") {
+    if (validStatuses.includes(body.status as typeof validStatuses[number])) {
+      patch.status = body.status as typeof validStatuses[number];
+    } else {
+      return res.status(400).json({ error: `invalid status: ${body.status}` });
+    }
+  }
+
+  if ("merge_status" in body && typeof body.merge_status === "string") {
+    if (validMergeStatuses.includes(body.merge_status as typeof validMergeStatuses[number])) {
+      patch.merge_status = body.merge_status as typeof validMergeStatuses[number];
+    } else {
+      return res.status(400).json({ error: `invalid merge_status: ${body.merge_status}` });
+    }
+  }
+
+  if ("error" in body && typeof body.error === "string") {
+    patch.error = body.error;
+  }
+
+  if (Object.keys(patch).length === 0) {
+    return res.status(400).json({ error: "no valid fields to update" });
+  }
+
+  const terminalStatuses = ["merged", "failed", "canceled", "rejected"];
+  if (patch.status && terminalStatuses.includes(patch.status) && !run.finished_at) {
+    patch.finished_at = new Date().toISOString();
+  }
+
+  const updated = updateRun(req.params.runId, patch);
+  if (!updated) {
+    return res.status(500).json({ error: "failed to update run" });
+  }
+
+  const updatedRun = getRunById(req.params.runId);
+  return res.json(updatedRun);
+});
+
+app.post("/runs/:runId/provide-input", (req, res) => {
+  const inputs =
+    req.body && typeof req.body === "object" && "inputs" in req.body
+      ? (req.body.inputs as Record<string, unknown>)
+      : null;
+  if (!inputs || typeof inputs !== "object" || Array.isArray(inputs)) {
+    return res.status(400).json({ error: "inputs object required" });
+  }
+  const incidentIdRaw =
+    req.body && typeof req.body === "object" && "incident_id" in req.body
+      ? req.body.incident_id
+      : null;
+  const incidentId =
+    typeof incidentIdRaw === "string" && incidentIdRaw.trim() ? incidentIdRaw.trim() : null;
+
+  let falsePositive: boolean | undefined;
+  if (req.body && typeof req.body === "object" && "false_positive" in req.body) {
+    if (typeof req.body.false_positive === "boolean") {
+      falsePositive = req.body.false_positive;
+    } else {
+      return res.status(400).json({ error: "`false_positive` must be boolean" });
+    }
+  }
+
+  const resolutionNotesRaw =
+    req.body && typeof req.body === "object" && "resolution_notes" in req.body
+      ? req.body.resolution_notes
+      : null;
+  const resolutionNotes =
+    typeof resolutionNotesRaw === "string" ? resolutionNotesRaw.trim() : undefined;
+
+  const result = provideRunInput(req.params.runId, inputs, {
+    incidentId,
+    falsePositive,
+    resolutionNotes,
+  });
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  try {
+    createUserInteraction({
+      action_type: "run_input_provided",
+      context: { run_id: req.params.runId },
+    });
+  } catch {
+    // Ignore interaction logging failures.
+  }
+  return res.json({ ok: true });
+});
+
+app.post("/runs/:runId/resolve", (req, res) => {
+  const result = finalizeManualRunResolution(req.params.runId);
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  try {
+    createUserInteraction({
+      action_type: "run_resolved",
+      context: { run_id: req.params.runId },
+    });
+  } catch {
+    // Ignore interaction logging failures.
+  }
+  return res.json({ ok: true });
+});
+
+app.post("/repos/scan", (_req, res) => {
+  const repos = getDiscoveredRepoPaths({ forceRescan: true });
+  return res.json({ ok: true, scanned_at: new Date().toISOString(), repos });
+});
+
+app.get("/chat/global", (_req, res) => {
+  const details = getChatThreadDetails({ scope: "global" });
+  const thread = markChatThreadRead(details.thread.id) ?? details.thread;
+  const attention =
+    listChatAttentionSummaries({ threadIds: [details.thread.id] }).get(details.thread.id) ??
+    { needs_you: false, reason_codes: [], reasons: [], last_event_at: null };
+  const ledger = listChatActionLedger({ threadId: details.thread.id, limit: 200 });
+  return res.json({
+    ...details,
+    thread: { ...thread, attention },
+    action_ledger: ledger,
+  });
+});
+
+app.get("/chat/attention", (_req, res) => {
+  return res.json(listChatAttention());
+});
+
+app.get("/chat/stream", (req, res) => {
+  const threadId = typeof req.query.thread_id === "string" ? req.query.thread_id : null;
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+  res.write(`:connected ${new Date().toISOString()}\n\n`);
+
+  const sendEvent = (event: ChatStreamEvent) => {
+    if (threadId && event.thread_id !== threadId) return;
+    res.write(`event: ${event.type}\n`);
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+  };
+
+  const unsubscribe = onChatStreamEvent(sendEvent);
+  const heartbeat = setInterval(() => {
+    res.write(":keepalive\n\n");
+  }, 25000);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+    res.end();
+  });
+});
+
+app.get("/chat/threads", (req, res) => {
+  const includeArchived = req.query.include_archived === "1";
+  const limitRaw = req.query.limit ? Number(req.query.limit) : NaN;
+  const limit = Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : undefined;
+  try {
+    const threads = listChatThreads({ includeArchived, limit });
+    const attentionByThread = listChatAttentionSummaries({
+      threadIds: threads.map((thread) => thread.id),
+    });
+    const enriched = threads.map((thread) => {
+      const attention = attentionByThread.get(thread.id) ?? {
+        needs_you: false,
+        reason_codes: [],
+        reasons: [],
+        last_event_at: null,
+      };
+      return { ...thread, attention };
+    });
+    return res.json({ threads: enriched });
+  } catch (err) {
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.post("/chat/threads", (req, res) => {
+  try {
+    const payload = ChatThreadCreateRequestSchema.parse(req.body ?? {});
+
+    const scope = payload.scope;
+    if (scope === "global") {
+      if (payload.projectId || payload.workOrderId) {
+        return res.status(400).json({ error: "global threads cannot include projectId/workOrderId" });
+      }
+    } else if (scope === "project") {
+      if (!payload.projectId) {
+        return res.status(400).json({ error: "projectId required for project threads" });
+      }
+      if (payload.workOrderId) {
+        return res.status(400).json({ error: "workOrderId must be omitted for project threads" });
+      }
+      const project = findProjectById(payload.projectId);
+      if (!project) return res.status(404).json({ error: "project not found" });
+    } else if (scope === "work_order") {
+      if (!payload.projectId || !payload.workOrderId) {
+        return res.status(400).json({ error: "projectId + workOrderId required for work_order threads" });
+      }
+      const project = findProjectById(payload.projectId);
+      if (!project) return res.status(404).json({ error: "project not found" });
+      try {
+        getWorkOrder(project.path, payload.workOrderId);
+      } catch {
+        return res.status(404).json({ error: "work order not found" });
+      }
+    }
+
+    const thread = createChatThread({
+      scope,
+      projectId: payload.projectId,
+      workOrderId: payload.workOrderId,
+      name: payload.name,
+      defaultContextDepth: payload.defaults?.context?.depth,
+      defaultAccess: payload.defaults?.access,
+    });
+    return res.status(201).json(thread);
+  } catch (err) {
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.get("/chat/threads/:threadId", (req, res) => {
+  const details = getChatThreadDetailsById(req.params.threadId);
+  if (!details) return res.status(404).json({ error: "thread not found" });
+  const thread = markChatThreadRead(details.thread.id) ?? details.thread;
+  const attention =
+    listChatAttentionSummaries({ threadIds: [details.thread.id] }).get(details.thread.id) ??
+    {
+      needs_you: false,
+      reason_codes: [],
+      reasons: [],
+      last_event_at: null,
+    };
+  const threadWithAttention = { ...thread, attention };
+  const ledger = listChatActionLedger({ threadId: details.thread.id, limit: 200 });
+  return res.json({ ...details, thread: threadWithAttention, action_ledger: ledger });
+});
+
+app.get("/chat/threads/:threadId/worktree/diff", (req, res) => {
+  try {
+    const thread = getChatThreadById(req.params.threadId);
+    if (!thread) return res.status(404).json({ error: "thread not found" });
+    if (thread.scope === "global") {
+      return res.status(400).json({ error: "global threads do not support worktree diffs" });
+    }
+    const projectId = thread.project_id;
+    if (!projectId) return res.status(400).json({ error: "thread missing project_id" });
+    const project = findProjectById(projectId);
+    if (!project) return res.status(404).json({ error: "project not found" });
+    const { worktreePath } = resolveChatWorktreeConfig(thread.id, thread.worktree_path);
+    if (!fs.existsSync(worktreePath)) {
+      return res.status(404).json({ error: "worktree not found" });
+    }
+    const diff = buildWorktreeDiff({ worktreePath, repoPath: project.path });
+    updateChatThread({
+      threadId: thread.id,
+      worktreePath: thread.worktree_path ?? worktreePath,
+      hasPendingChanges: diff.hasPendingChanges,
+    });
+    return res.json({ diff: diff.diff, has_pending_changes: diff.hasPendingChanges });
+  } catch (err) {
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.patch("/chat/threads/:threadId", (req, res) => {
+  const threadId = req.params.threadId;
+  const existing = getChatThreadById(threadId);
+  if (!existing) return res.status(404).json({ error: "thread not found" });
+  try {
+    const payload = ChatThreadUpdateRequestSchema.parse(req.body ?? {});
+
+    if ((payload.projectId !== undefined || payload.workOrderId !== undefined) && !payload.scope) {
+      return res.status(400).json({ error: "scope must be provided when changing projectId/workOrderId" });
+    }
+
+    const nextScope = payload.scope ?? existing.scope;
+    const nextName = payload.name ?? undefined;
+    const archivedAt =
+      payload.archived === undefined
+        ? undefined
+        : payload.archived
+          ? new Date().toISOString()
+          : null;
+    const willArchive = payload.archived === true && !existing.archived_at;
+
+    const nextProjectId = (() => {
+      if (!payload.scope) return undefined;
+      if (nextScope === "global") return null;
+      if (!payload.projectId) return undefined;
+      return payload.projectId;
+    })();
+
+    const nextWorkOrderId = (() => {
+      if (!payload.scope) return undefined;
+      if (nextScope !== "work_order") return null;
+      if (!payload.workOrderId) return undefined;
+      return payload.workOrderId;
+    })();
+
+    if (payload.scope === "global") {
+      if (payload.projectId || payload.workOrderId) {
+        return res.status(400).json({ error: "global threads cannot include projectId/workOrderId" });
+      }
+    } else if (payload.scope === "project") {
+      if (!payload.projectId) return res.status(400).json({ error: "projectId required for project threads" });
+      if (payload.workOrderId) return res.status(400).json({ error: "workOrderId must be omitted for project threads" });
+      const project = findProjectById(payload.projectId);
+      if (!project) return res.status(404).json({ error: "project not found" });
+    } else if (payload.scope === "work_order") {
+      if (!payload.projectId || !payload.workOrderId) {
+        return res.status(400).json({ error: "projectId + workOrderId required for work_order threads" });
+      }
+      const project = findProjectById(payload.projectId);
+      if (!project) return res.status(404).json({ error: "project not found" });
+      try {
+        getWorkOrder(project.path, payload.workOrderId);
+      } catch {
+        return res.status(404).json({ error: "work order not found" });
+      }
+    }
+
+    const updated = updateChatThread({
+      threadId,
+      name: nextName,
+      scope: payload.scope ?? undefined,
+      projectId: nextProjectId,
+      workOrderId: nextWorkOrderId,
+      defaultContextDepth: payload.defaults?.context?.depth,
+      defaultAccess: payload.defaults?.access,
+      archivedAt,
+      worktreePath: willArchive ? null : undefined,
+      hasPendingChanges: willArchive ? false : undefined,
+    });
+    if (!updated) return res.status(404).json({ error: "thread not found" });
+    if (willArchive) {
+      try {
+        cleanupThreadWorktree(existing);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`Failed to clean up worktree for thread ${existing.id}: ${String(err)}`);
+      }
+    }
+    return res.json(updated);
+  } catch (err) {
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.post("/chat/threads/:threadId/ack", (req, res) => {
+  const threadId = req.params.threadId;
+  const existing = getChatThreadById(threadId);
+  if (!existing) return res.status(404).json({ error: "thread not found" });
+  const updated =
+    updateChatThread({ threadId, lastAckAt: new Date().toISOString() }) ?? existing;
+  const attention =
+    listChatAttentionSummaries({ threadIds: [threadId] }).get(threadId) ??
+    { needs_you: false, reason_codes: [], reasons: [], last_event_at: null };
+  return res.json({ thread: { ...updated, attention } });
+});
+
+app.post("/chat/threads/:threadId/pending-sends/:pendingSendId/cancel", (req, res) => {
+  const { threadId, pendingSendId } = req.params;
+  const pending = getChatPendingSendById(pendingSendId);
+  if (!pending) return res.status(404).json({ error: "pending send not found" });
+  if (pending.thread_id !== threadId) {
+    return res.status(400).json({ error: "pending send does not belong to thread" });
+  }
+  const ok = markChatPendingSendCanceled(pendingSendId);
+  if (!ok) return res.status(400).json({ error: "pending send already resolved" });
+  return res.json({ ok: true });
+});
+
+app.post("/chat/threads/:threadId/messages", (req, res) => {
+  const threadId = req.params.threadId;
+  try {
+    const payload = ChatMessageRequestSchema.parse(req.body ?? {});
+    const thread = getChatThreadById(threadId);
+    if (thread?.scope === "global") {
+      pauseAutonomousSessionForUserMessage();
+    }
+    const run = enqueueChatTurnForThread({
+      threadId,
+      content: payload.content,
+      context: payload.context,
+      access: payload.access,
+      suggestion: payload.suggestion,
+      confirmations: payload.confirmations,
+    });
+    return res.status(201).json(run);
+  } catch (err) {
+    if (err instanceof PendingSendError) {
+      return res.status(409).json({
+        error: err.message,
+        pending_send_id: err.pendingSendId,
+        requires: err.requires,
+      });
+    }
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.post("/chat/threads/:threadId/suggestions", async (req, res) => {
+  const threadId = req.params.threadId;
+  try {
+    const payload = ChatSuggestRequestSchema.parse(req.body ?? {});
+    const suggestion = await suggestChatSettingsForThread({
+      threadId,
+      content: payload.content,
+      context: payload.context,
+      access: payload.access,
+    });
+    return res.json({ suggestion });
+  } catch (err) {
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.post("/chat/global/messages", (req, res) => {
+  try {
+    const payload = ChatMessageRequestSchema.parse(req.body ?? {});
+    pauseAutonomousSessionForUserMessage();
+    const run = enqueueChatTurn({
+      scope: "global",
+      content: payload.content,
+      context: payload.context,
+      access: payload.access,
+      suggestion: payload.suggestion,
+      confirmations: payload.confirmations,
+    });
+    return res.status(201).json(run);
+  } catch (err) {
+    if (err instanceof PendingSendError) {
+      return res.status(409).json({
+        error: err.message,
+        pending_send_id: err.pendingSendId,
+        requires: err.requires,
+      });
+    }
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.post("/chat/global/suggestions", async (req, res) => {
+  try {
+    const payload = ChatSuggestRequestSchema.parse(req.body ?? {});
+    const suggestion = await suggestChatSettings({
+      scope: "global",
+      content: payload.content,
+      context: payload.context,
+      access: payload.access,
+    });
+    return res.json({ suggestion });
+  } catch (err) {
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.get("/chat/projects/:id", (req, res) => {
+  const { id } = req.params;
+  const details = getChatThreadDetails({ scope: "project", projectId: id });
+  const thread = markChatThreadRead(details.thread.id) ?? details.thread;
+  const attention =
+    listChatAttentionSummaries({ threadIds: [details.thread.id] }).get(details.thread.id) ??
+    { needs_you: false, reason_codes: [], reasons: [], last_event_at: null };
+  const ledger = listChatActionLedger({ threadId: details.thread.id, limit: 200 });
+  return res.json({
+    ...details,
+    thread: { ...thread, attention },
+    action_ledger: ledger,
+  });
+});
+
+app.post("/chat/projects/:id/messages", (req, res) => {
+  const { id } = req.params;
+  try {
+    const payload = ChatMessageRequestSchema.parse(req.body ?? {});
+    const run = enqueueChatTurn({
+      scope: "project",
+      projectId: id,
+      content: payload.content,
+      context: payload.context,
+      access: payload.access,
+      suggestion: payload.suggestion,
+      confirmations: payload.confirmations,
+    });
+    return res.status(201).json(run);
+  } catch (err) {
+    if (err instanceof PendingSendError) {
+      return res.status(409).json({
+        error: err.message,
+        pending_send_id: err.pendingSendId,
+        requires: err.requires,
+      });
+    }
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.post("/chat/projects/:id/suggestions", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const payload = ChatSuggestRequestSchema.parse(req.body ?? {});
+    const suggestion = await suggestChatSettings({
+      scope: "project",
+      projectId: id,
+      content: payload.content,
+      context: payload.context,
+      access: payload.access,
+    });
+    return res.json({ suggestion });
+  } catch (err) {
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.get("/chat/projects/:id/work-orders/:workOrderId", (req, res) => {
+  const { id, workOrderId } = req.params;
+  const details = getChatThreadDetails({ scope: "work_order", projectId: id, workOrderId });
+  const thread = markChatThreadRead(details.thread.id) ?? details.thread;
+  const attention =
+    listChatAttentionSummaries({ threadIds: [details.thread.id] }).get(details.thread.id) ??
+    { needs_you: false, reason_codes: [], reasons: [], last_event_at: null };
+  const ledger = listChatActionLedger({ threadId: details.thread.id, limit: 200 });
+  return res.json({
+    ...details,
+    thread: { ...thread, attention },
+    action_ledger: ledger,
+  });
+});
+
+app.post("/chat/projects/:id/work-orders/:workOrderId/messages", (req, res) => {
+  const { id, workOrderId } = req.params;
+  try {
+    const payload = ChatMessageRequestSchema.parse(req.body ?? {});
+    const run = enqueueChatTurn({
+      scope: "work_order",
+      projectId: id,
+      workOrderId,
+      content: payload.content,
+      context: payload.context,
+      access: payload.access,
+      suggestion: payload.suggestion,
+      confirmations: payload.confirmations,
+    });
+    return res.status(201).json(run);
+  } catch (err) {
+    if (err instanceof PendingSendError) {
+      return res.status(409).json({
+        error: err.message,
+        pending_send_id: err.pendingSendId,
+        requires: err.requires,
+      });
+    }
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.post("/chat/projects/:id/work-orders/:workOrderId/suggestions", async (req, res) => {
+  const { id, workOrderId } = req.params;
+  try {
+    const payload = ChatSuggestRequestSchema.parse(req.body ?? {});
+    const suggestion = await suggestChatSettings({
+      scope: "work_order",
+      projectId: id,
+      workOrderId,
+      content: payload.content,
+      context: payload.context,
+      access: payload.access,
+    });
+    return res.json({ suggestion });
+  } catch (err) {
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.get("/chat/runs/:runId", (req, res) => {
+  const run = getChatRunDetails(req.params.runId);
+  if (!run) return res.status(404).json({ error: "run not found" });
+  return res.json(run);
+});
+
+app.post("/chat/actions/apply", (req, res) => {
+  try {
+    const applied = applyChatAction(req.body ?? {});
+    return res.status(201).json(applied);
+  } catch (err) {
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+app.post("/chat/actions/:ledgerId/undo", (req, res) => {
+  try {
+    const result = undoChatAction(req.params.ledgerId);
+    return res.json(result);
+  } catch (err) {
+    return res.status(400).json({ error: String(err instanceof Error ? err.message : err) });
+  }
+});
+
+const failRunsOnRestart =
+  getFailRunsOnRestart();
+const recovered = failRunsOnRestart
+  ? markInProgressRunsFailed("Server restarted; run aborted.")
+  : 0;
+app.listen(port, host, () => {
+  // eslint-disable-next-line no-console
+  console.log(`Shiftboss server listening on http://${host}:${port}`);
+  if (recovered) {
+    // eslint-disable-next-line no-console
+    console.log(`Marked ${recovered} in-progress runs as failed (restart recovery).`);
+  }
+  startEscalationTimeoutSweep();
+  startSlackConversationSweep();
+  startSmsConversationSweep();
+  startShiftScheduler();
+  startAutopilotScheduler();
+  startConversationBackgroundSync();
+  recoverAutonomousSessionLoop();
+});

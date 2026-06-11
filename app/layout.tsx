@@ -1,0 +1,47 @@
+import "./globals.css";
+import type { Metadata, Viewport } from "next";
+import { Suspense } from "react";
+import { NavBar } from "./components/NavBar";
+import { ChatWidget } from "./components/ChatWidget";
+import { VoicePresentationModal } from "./components/VoicePresentationModal";
+
+export const metadata: Metadata = {
+  title: "Shiftboss",
+  description: "Local-first mission control for AI coding agents.",
+  manifest: "/manifest.webmanifest",
+  icons: {
+    icon: [
+      { url: "/icon-192.png", sizes: "192x192", type: "image/png" },
+      { url: "/icon-512.png", sizes: "512x512", type: "image/png" },
+      { url: "/icon.svg", type: "image/svg+xml" },
+    ],
+    apple: [{ url: "/apple-touch-icon.png", sizes: "180x180", type: "image/png" }],
+  },
+};
+
+export const viewport: Viewport = {
+  themeColor: "#0b0d12",
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en">
+      <body>
+        <Suspense fallback={null}>
+          <NavBar />
+        </Suspense>
+        <div className="container">
+          {children}
+        </div>
+        <VoicePresentationModal />
+        <Suspense fallback={null}>
+          <ChatWidget />
+        </Suspense>
+      </body>
+    </html>
+  );
+}

@@ -1,0 +1,67 @@
+# Decisions
+
+Key architectural/product choices and why. This file should stay short and current.
+
+## Local-first + ngrok access
+- **Decision:** Run everything on the laptop; expose UI via ngrok basic auth.
+- **Why:** Fastest way to get “access anywhere” without building cloud infra.
+- **Notes:** Treat as internet-facing; strong password; reserved domain; rate limit later.
+
+## Hybrid portfolio metadata
+- **Decision:** Store global indexed state/history in SQLite, plus per-repo sidecar `.control.yml`.
+- **Why:** SQLite enables fast queries/history; sidecar keeps “human truth” portable with repos.
+
+## Work Orders as contract-backed cards
+- **Decision:** All ongoing work lives as Work Orders in `work_orders/` with YAML frontmatter.
+- **Why:** Spec-first, agent-friendly, and easy to visualize as Kanban.
+- **Ready contract:** `goal`, `acceptance_criteria`, and `stop_conditions` required before runs start.
+- **Required metadata:** `depends_on` array (can be empty) and `era` (`v0`, `v1`, `v2`); validation warns but does not block.
+- **Optional:** `base_branch` may be set to define a default worktree base for runs.
+
+## Two-agent gate before human review
+- **Decision:** Every Work Order run uses a Builder agent then a fresh Reviewer agent; only approved outputs reach you.
+- **Why:** You shouldn’t triage unreviewed AI diffs; reduces noise and risk.
+
+## Reviewer read-only inspection
+- **Decision:** Reviewer may run read-only shell commands against a sanitized repo snapshot when needed (in addition to Work Order + diff).
+- **Why:** Avoids “diff-only” blind spots (e.g., no-op diffs, missing surrounding context) and improves convergence without granting write access.
+
+## Opt-in full reviewer snapshots for asset-heavy work orders
+- **Decision:** Reviewer snapshots default to git-tracked files; Work Orders can opt into full worktree snapshots with `reviewer_snapshot: full`.
+- **Why:** Enables verification of required local assets without globally copying large gitignored directories.
+
+## Summary-first review UX
+- **Decision:** UI shows run summary, files changed list, tests status, and reviewer verdict; diffs only on demand.
+- **Why:** Keep human loop lightweight while preserving escape hatches.
+
+## Next.js PWA UI + Node/TS runner
+- **Decision:** Next.js (TypeScript) for UI with PWA support; Node/TS local server for scanning/runs.
+- **Why:** Strong mobile UX, fast iteration, matches your existing stack.
+
+## Pluggable provider interface
+- **Decision:** Define provider abstraction now; add providers behind it instead of rewriting the run flow.
+- **Why:** Avoid rewriting flow when adding providers; keep settings-driven.
+- **Status:** `codex` and `claude_code` implemented; `gemini_cli` defined in the interface but not implemented.
+
+## Local execution with sandboxed agents (supersedes VM isolation)
+- **Decision:** Runs execute locally in per-run git worktrees, with provider sandbox modes (`SHIFTBOSS_BUILDER_SANDBOX`, default `workspace-write`; reviewer defaults to read-only).
+- **Why:** Worktrees already isolate changes from `main`; a local-first core should not require cloud infrastructure to be useful.
+- **History:** An earlier design ran each project on a dedicated GCP VM orchestrated over SSH. That code was removed from the core; managed/remote execution is out of scope for this repo.
+
+## Chat system with worktree isolation
+- **Decision:** Chat threads can make file changes in isolated git worktrees; changes only affect main when user explicitly merges.
+- **Why:** Prevents accidental changes to main branch; gives user control over when chat modifications are applied.
+- **Implementation:** Per-thread worktree at `.system/chat-worktrees/thread-{id}/`, merge via UI button.
+
+## Era-based work order organization
+- **Decision:** Work orders are grouped into eras (v0, v1, v2) representing project maturity stages.
+- **Why:** Provides clear progression, helps prioritization, and enables tech tree visualization by era lanes.
+- **Eras:**
+  - v0: Bootstrap/foundation (charter, discovery, kanban, runner)
+  - v1: Core features (chat, settings, testing, worktree)
+  - v2: Advanced (VM isolation, constitution, autonomous runner, cost metering)
+
+## Run status sync with work order status
+- **Decision:** When a work order is marked done, associated runs should auto-transition to merged.
+- **Why:** Prevents stale "You Review" cards on Kanban when WO is already complete.
+- **Status:** Manual fix applied; WO-2026-044 tracks automated solution.

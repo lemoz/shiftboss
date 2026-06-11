@@ -1,0 +1,47 @@
+# Meeting Voice Agent (Pipecat)
+
+Minimal Python service for the meeting voice agent. It loads configuration from
+the environment, wires the Pipecat pipeline (ElevenLabs STT -> Claude LLM ->
+ElevenLabs TTS), and runs a WebSocket audio transport (falling back to local
+audio when needed).
+
+## Setup
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Run
+```
+python main.py
+```
+
+## Environment
+Required for the pipeline:
+- `SHIFTBOSS_ELEVENLABS_API_KEY` (legacy `CONTROL_CENTER_ELEVENLABS_API_KEY` still works)
+- `ELEVENLABS_VOICE_ID`
+- `ANTHROPIC_API_KEY`
+
+Optional:
+- `SHIFTBOSS_BASE_URL` (default: `http://localhost:4010`; legacy `PCC_BASE_URL` still works)
+- `ANTHROPIC_MODEL` (default: `claude-3-5-sonnet-20240620`)
+- `ANTHROPIC_TEMPERATURE` (default: `0.2`)
+- `ANTHROPIC_MAX_TOKENS` (default: `256`)
+- `ELEVENLABS_STT_MODEL_ID`
+- `ELEVENLABS_TTS_MODEL_ID`
+- `ELEVENLABS_TTS_FORMAT`
+- `VOICE_AGENT_HOST` (default: `0.0.0.0`)
+- `VOICE_AGENT_PORT` (default: `8765`)
+- `MEETING_PROJECT_ID` (project id for notes/summary defaults)
+- `MEETING_ID` (meeting identifier for linking notes/action items)
+- `MEETING_TITLE` (optional meeting title metadata)
+- `MEETING_STARTED_AT` (ISO timestamp when meeting started)
+- `MEETING_ATTENDEE_EMAILS` (comma-separated attendee emails for people resolution)
+
+Audio config (Recall.ai defaults):
+- `VOICE_AUDIO_SAMPLE_RATE` (default: `16000`)
+- `VOICE_AUDIO_CHANNELS` (default: `1`)
+- `VOICE_AUDIO_SAMPLE_WIDTH` (default: `2`)
+- `VOICE_AUDIO_FRAME_MS` (default: `20`)
+- `VOICE_AUDIO_FORMAT` (default: `pcm_s16le`)

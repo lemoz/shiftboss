@@ -1,0 +1,44 @@
+name: Private Data Guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      # Pull the repo so the guard can scan tracked files.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Fail if any tracked file contains deny-listed private strings or
+      # if database/backup/env files are tracked.
+      - name: Scan tracked files for private data
+        run: |
+          status=0
+
+          # Deny-listed strings must not appear in any tracked file.
+          if git grep -I -i -E 'scrolller|videonest|pursuitshq|dicer|orbitalclaw|openclaw|cdossman|crucial.x10|t015e1a6n6l|doittogether' -- ':!.github/workflows/private-data-guard.yml'; then
+            echo "::error::Deny-listed private strings found in tracked files (see matches above)."
+            status=1
+          fi
+
+          # Database dumps and backups must never be tracked.
+          bad_files=$(git ls-files | grep -E '\.(bak|db)$' || true)
+          if [ -n "$bad_files" ]; then
+            echo "$bad_files"
+            echo "::error::Tracked *.bak or *.db files found (see list above)."
+            status=1
+          fi
+
+          # Env files (other than .env.example) must never be tracked.
+          bad_env=$(git ls-files | grep -E '(^|/)\.env(\..*)?$' | grep -v -E '(^|/)\.env\.example$' || true)
+          if [ -n "$bad_env" ]; then
+            echo "$bad_env"
+            echo "::error::Tracked .env files found (see list above)."
+            status=1
+          fi
+
+          exit $status

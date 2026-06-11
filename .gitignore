@@ -1,0 +1,44 @@
+node_modules
+node_modules/
+.npm/
+.next/
+.next-dev/
+dist/
+build/
+
+*.log
+.DS_Store
+._*
+*.tsbuildinfo
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Local-only seed data
+scripts/seed_descriptions.local.json
+
+# Constitution drafts
+.constitution.md
+.constitution.versions/
+
+# SQLite / local state
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+control-center.db
+control-center.db-*
+control-center.db.*
+*.bak
+
+# Runner artifacts
+.system/
+
+# E2E artifacts
+e2e/.tmp/
+test-results/
+playwright-report/
