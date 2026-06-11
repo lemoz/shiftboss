@@ -279,6 +279,7 @@ import {
   getRun,
   getRunsForProject,
   approveRunMerge,
+  isRunWorkerAlive,
   provideRunInput,
   rejectRun,
   resumeRun,
@@ -6813,7 +6814,7 @@ app.post("/chat/actions/:ledgerId/undo", (req, res) => {
 const failRunsOnRestart =
   getFailRunsOnRestart();
 const recovered = failRunsOnRestart
-  ? markInProgressRunsFailed("Server restarted; run aborted.")
+  ? markInProgressRunsFailed("Server restarted; run aborted.", isRunWorkerAlive)
   : 0;
 app.listen(port, host, () => {
   // eslint-disable-next-line no-console
