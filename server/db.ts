@@ -895,6 +895,8 @@ export type ShiftRow = {
   status: ShiftStatus;
   agent_type: string | null;
   agent_id: string | null;
+  /** PID of the spawned claude process; null when not yet set or already reaped. */
+  pid: number | null;
   started_at: string;
   completed_at: string | null;
   expires_at: string | null;
@@ -2665,6 +2667,22 @@ function initSchema(database: Database.Database) {
     );
   `);
 
+  // Job supervision table — one row per live server-managed process.
+  // Guarded: safe to run on an existing DB that already has the table.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS jobs (
+      id         TEXT PRIMARY KEY,
+      kind       TEXT NOT NULL,
+      ref_id     TEXT NOT NULL,
+      pid        INTEGER,
+      started_at TEXT NOT NULL,
+      heartbeat_at TEXT NOT NULL,
+      status     TEXT NOT NULL DEFAULT 'running'
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs(kind, status);
+    CREATE INDEX IF NOT EXISTS idx_jobs_heartbeat   ON jobs(heartbeat_at) WHERE status = 'running';
+  `);
+
   // merge_locks heartbeat_at migration
   const mergeLockColumns = database
     .prepare("PRAGMA table_info(merge_locks)")
@@ -2672,6 +2690,16 @@ function initSchema(database: Database.Database) {
   const hasHeartbeatAt = mergeLockColumns.some((c) => c.name === "heartbeat_at");
   if (!hasHeartbeatAt && mergeLockColumns.length > 0) {
     database.exec("ALTER TABLE merge_locks ADD COLUMN heartbeat_at TEXT;");
+  }
+
+  // shifts pid column — persists the agent process pid so the reaper can kill
+  // orphaned claude processes after restart or timer loss.
+  const shiftColumns = database
+    .prepare("PRAGMA table_info(shifts)")
+    .all() as Array<{ name: string }>;
+  const hasShiftPid = shiftColumns.some((c) => c.name === "pid");
+  if (!hasShiftPid && shiftColumns.length > 0) {
+    database.exec("ALTER TABLE shifts ADD COLUMN pid INTEGER;");
   }
 }
 
@@ -7239,6 +7267,7 @@ export function startShift(params: {
       status: "active",
       agent_type: agentType,
       agent_id: agentId,
+      pid: null,
       started_at: startedAt,
       completed_at: null,
       expires_at: expiresAt,
@@ -7249,9 +7278,9 @@ export function startShift(params: {
     database
       .prepare(
         `INSERT INTO shifts
-          (id, project_id, status, agent_type, agent_id, started_at, completed_at, expires_at, handoff_id, error)
+          (id, project_id, status, agent_type, agent_id, pid, started_at, completed_at, expires_at, handoff_id, error)
          VALUES
-          (@id, @project_id, @status, @agent_type, @agent_id, @started_at, @completed_at, @expires_at, @handoff_id, @error)`
+          (@id, @project_id, @status, @agent_type, @agent_id, @pid, @started_at, @completed_at, @expires_at, @handoff_id, @error)`
       )
       .run(row);
     return { ok: true, shift: row } as const;
@@ -7293,7 +7322,7 @@ export function getShiftByProjectId(projectId: string, shiftId: string): ShiftRo
 export function updateShift(
   id: string,
   patch: Partial<
-    Pick<ShiftRow, "status" | "completed_at" | "expires_at" | "handoff_id" | "error">
+    Pick<ShiftRow, "status" | "completed_at" | "expires_at" | "handoff_id" | "error" | "pid">
   >
 ): boolean {
   const database = getDb();
@@ -7303,6 +7332,7 @@ export function updateShift(
     { key: "expires_at", column: "expires_at" },
     { key: "handoff_id", column: "handoff_id" },
     { key: "error", column: "error" },
+    { key: "pid", column: "pid" },
   ];
   const sets = fields
     .filter((field) => patch[field.key] !== undefined)
@@ -8050,4 +8080,107 @@ export function createConstitutionVersion(params: {
 
   insert();
   return toConstitutionVersion(row);
+}
+
+// ---------------------------------------------------------------------------
+// Job supervision — thin CRUD layer for the `jobs` table.
+// The actual reaper lives in server/job_supervisor.ts to avoid circular deps.
+// ---------------------------------------------------------------------------
+
+export type JobKind = "run" | "shift" | "chat" | "global_session";
+export type JobStatus = "running" | "done" | "failed";
+
+export type JobRow = {
+  id: string;
+  kind: JobKind;
+  /** External id: run_id, shift_id, chat_run_id, or session_id */
+  ref_id: string;
+  pid: number | null;
+  started_at: string;
+  heartbeat_at: string;
+  status: JobStatus;
+};
+
+export function registerJob(params: {
+  kind: JobKind;
+  ref_id: string;
+  pid?: number | null;
+}): JobRow {
+  const database = getDb();
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const row: JobRow = {
+    id,
+    kind: params.kind,
+    ref_id: params.ref_id,
+    pid: params.pid ?? null,
+    started_at: now,
+    heartbeat_at: now,
+    status: "running",
+  };
+  database
+    .prepare(
+      `INSERT INTO jobs (id, kind, ref_id, pid, started_at, heartbeat_at, status)
+       VALUES (@id, @kind, @ref_id, @pid, @started_at, @heartbeat_at, @status)`
+    )
+    .run(row);
+  return row;
+}
+
+export function beatJob(jobId: string): boolean {
+  const database = getDb();
+  const now = new Date().toISOString();
+  const result = database
+    .prepare("UPDATE jobs SET heartbeat_at = ? WHERE id = ? AND status = 'running'")
+    .run(now, jobId);
+  return result.changes > 0;
+}
+
+export function completeJob(jobId: string, status: "done" | "failed" = "done"): boolean {
+  const database = getDb();
+  const result = database
+    .prepare("UPDATE jobs SET status = ? WHERE id = ? AND status = 'running'")
+    .run(status, jobId);
+  return result.changes > 0;
+}
+
+/**
+ * Returns all jobs whose heartbeat is more than `intervalMs * intervals` old
+ * and are still marked running.  Used by the reaper loop to detect orphans.
+ */
+export function listStaleJobs(intervalMs: number, intervals = 3): JobRow[] {
+  const database = getDb();
+  const cutoff = new Date(Date.now() - intervalMs * intervals).toISOString();
+  return database
+    .prepare(
+      "SELECT * FROM jobs WHERE status = 'running' AND heartbeat_at < ?"
+    )
+    .all(cutoff) as JobRow[];
+}
+
+export function getJobById(jobId: string): JobRow | null {
+  const database = getDb();
+  const row = database
+    .prepare("SELECT * FROM jobs WHERE id = ? LIMIT 1")
+    .get(jobId) as JobRow | undefined;
+  return row ?? null;
+}
+
+export function getJobByRefId(refId: string): JobRow | null {
+  const database = getDb();
+  const row = database
+    .prepare("SELECT * FROM jobs WHERE ref_id = ? AND status = 'running' LIMIT 1")
+    .get(refId) as JobRow | undefined;
+  return row ?? null;
+}
+
+/**
+ * Returns all active (status='active') shifts that have a non-null pid.
+ * Used by startup recovery to re-arm kill timers for orphaned claude processes.
+ */
+export function listActiveShiftsWithPid(): ShiftRow[] {
+  const database = getDb();
+  return database
+    .prepare("SELECT * FROM shifts WHERE status = 'active' AND pid IS NOT NULL")
+    .all() as ShiftRow[];
 }

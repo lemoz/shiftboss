@@ -8,7 +8,7 @@ import {
   getProcessEnv,
   getUseTsWorker,
 } from "./config.js";
-import { findProjectById, getDb } from "./db.js";
+import { findProjectById, getDb, registerJob } from "./db.js";
 import { parseCodexTokenUsageFromLog, recordCostEntry } from "./cost_tracking.js";
 import {
   countChatMessages,
@@ -2214,6 +2214,10 @@ function spawnChatWorker(runId: string) {
     detached: true,
   });
   child.unref();
+  // Register so the reaper detects a crashed chat worker.
+  if (child.pid) {
+    registerJob({ kind: "chat", ref_id: runId, pid: child.pid });
+  }
 }
 
 function claimRunOrExit(run: ChatRunRow): boolean {

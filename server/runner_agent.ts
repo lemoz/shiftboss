@@ -31,6 +31,7 @@ import {
   listRunsByProject,
   MERGE_LOCK_HEARTBEAT_INTERVAL_MS,
   refreshMergeLockHeartbeat,
+  registerJob,
   releaseMergeLock,
   PROJECT_MERGE_POLICIES,
   type SecurityIncidentRow,
@@ -91,6 +92,7 @@ import {
   type StreamMonitorIncident,
 } from "./stream_monitor.js";
 import { executeAgentCli, killProcessTree } from "./agent_execution.js";
+import { isProcessAlive } from "./process_utils.js";
 
 const DEFAULT_MAX_BUILDER_ITERATIONS = 10;
 const BASELINE_MAX_ATTEMPTS = 2;
@@ -5603,6 +5605,9 @@ export function enqueueCodexRun(
     }
     writeRunnerPid(runDir, worker.pid);
     updateRun(id, { worker_pid: worker.pid });
+    // Register in the jobs table so the reaper detects a crashed worker.
+    // Liveness is pid-probe-based (detached); no in-process heartbeat needed.
+    registerJob({ kind: "run", ref_id: id, pid: worker.pid });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     updateRun(id, {
@@ -5765,22 +5770,22 @@ export function provideRunInput(
   return { ok: true };
 }
 
-export function autoCancelEscalationTimeouts(timeoutHours: number): {
+export async function autoCancelEscalationTimeouts(timeoutHours: number): Promise<{
   checked: number;
   canceled: number;
-} {
+}> {
   const safeTimeoutHours =
     Number.isFinite(timeoutHours) && timeoutHours > 0 ? timeoutHours : 24;
   const timeoutMs = safeTimeoutHours * 60 * 60 * 1000;
   const database = getDb();
   const runs = database
     .prepare(
-      `SELECT id, escalation, log_path, created_at, started_at
+      `SELECT id, escalation, log_path, run_dir, created_at, started_at
        FROM runs
        WHERE status = 'waiting_for_input'`
     )
     .all() as Array<
-    Pick<RunRow, "id" | "escalation" | "log_path" | "created_at" | "started_at">
+    Pick<RunRow, "id" | "escalation" | "log_path" | "run_dir" | "created_at" | "started_at">
   >;
   const nowMs = Date.now();
   let canceled = 0;
@@ -5793,6 +5798,24 @@ export function autoCancelEscalationTimeouts(timeoutHours: number): {
 
     const message = `Escalation timeout - no input provided within ${safeTimeoutHours} hours`;
     appendLog(run.log_path, message);
+
+    // Kill the worker before marking canceled.  Without SIGCONT+SIGTERM, a
+    // SIGSTOP'd codex child (paused by startEscalation) never receives SIGTERM
+    // and hangs forever, while resumeRun would spawn a second worker on the
+    // same run_dir.  terminateRunner handles SIGCONT+SIGTERM+SIGKILL+group kill
+    // exactly as cancelRun does — reuse it here for parity.
+    // eslint-disable-next-line no-console
+    const killLog = (line: string) => { appendLog(run.log_path, line); console.log(`[escalation] ${line}`); };
+    const pid = readRunnerPid(run.run_dir);
+    if (pid) {
+      try {
+        await terminateRunner(pid, killLog);
+        clearRunnerPid(run.run_dir);
+      } catch (err) {
+        appendLog(run.log_path, `[escalation] failed to terminate runner pid=${pid}: ${String(err)}`);
+      }
+    }
+
     updateRun(run.id, {
       status: "canceled",
       finished_at: nowIso(),
@@ -5844,18 +5867,6 @@ export type RejectRunResult =
 
 function killTargetForPid(pid: number): number {
   return process.platform === "win32" ? pid : -pid;
-}
-
-function isProcessAlive(target: number): boolean {
-  try {
-    process.kill(target, 0);
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") return false;
-    if (code === "EPERM") return true;
-    throw err;
-  }
 }
 
 /**
@@ -6423,6 +6434,7 @@ export function resumeSecurityHoldRun(runId: string): SecurityHoldActionResult {
     }
     writeRunnerPid(run.run_dir, worker.pid);
     updateRun(runId, { worker_pid: worker.pid });
+    registerJob({ kind: "run", ref_id: runId, pid: worker.pid });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Failed to resume security hold: ${message}`);
@@ -6546,6 +6558,7 @@ export function resumeRun(runId: string): ResumeRunResult {
     }
     writeRunnerPid(run.run_dir, worker.pid);
     updateRun(runId, { worker_pid: worker.pid });
+    registerJob({ kind: "run", ref_id: runId, pid: worker.pid });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Failed to resume run: ${message}`);
