@@ -133,6 +133,106 @@ test("approveRunMerge merges human-approved runs into base branch", () => {
   assert.match(baseContent, /change-approve/);
 });
 
+// Regression test for: commit block must run before applyMergePolicyAfterApproval so that
+// approveRunMerge finds a real commit on the branch, not an empty branch-at-base-tip.
+// The fixture simulates what runRun now produces: a git worktree where the builder made
+// uncommitted changes and the runner's commit block staged+committed them onto the branch
+// before setting status=approved (i.e., before the policy gate fires).
+test("approveRunMerge lands builder changes committed via worktree before policy gate", () => {
+  const projectId = "project-wtcommit";
+  const runId = "run-wtcommit";
+  const repoPath = path.join(tmpRoot, "repo-wtcommit");
+  fs.mkdirSync(repoPath, { recursive: true });
+  runGit(repoPath, ["init"]);
+  runGit(repoPath, ["config", "user.email", "tester@example.com"]);
+  runGit(repoPath, ["config", "user.name", "Tester"]);
+  fs.writeFileSync(path.join(repoPath, "app.txt"), "base\n", "utf8");
+  fs.writeFileSync(path.join(repoPath, ".gitignore"), ".system/\n", "utf8");
+  runGit(repoPath, ["add", "."]);
+  runGit(repoPath, ["commit", "-m", "base"]);
+
+  const baseBranch = runGit(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  const branchName = "run/WO-200-wtcommit";
+  const runDir = path.join(repoPath, ".system", "runs", runId);
+  const worktreePath = path.join(runDir, "worktree");
+  fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+
+  // Simulate ensureWorktree: create run branch in a git worktree at runDir/worktree
+  runGit(repoPath, ["worktree", "add", "-b", branchName, worktreePath, baseBranch]);
+
+  // Simulate builder writing a file (uncommitted, as providers are instructed to do)
+  fs.appendFileSync(path.join(worktreePath, "app.txt"), "builder-change\n", "utf8");
+
+  // Simulate the commit block that now runs before the policy gate
+  runGit(worktreePath, ["config", "user.email", "runner@local"]);
+  runGit(worktreePath, ["config", "user.name", "Shiftboss Runner"]);
+  runGit(worktreePath, ["add", "app.txt"]);
+  runGit(worktreePath, ["commit", "-m", "WO-200: worktree commit"]);
+
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO projects (
+      id, path, name, type, stage, status, priority, merge_policy, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    projectId,
+    repoPath,
+    "Project WtCommit",
+    "prototype",
+    "active",
+    "active",
+    1,
+    "human_approve",
+    now,
+    now
+  );
+
+  const logPath = path.join(runDir, "run.log");
+  fs.writeFileSync(logPath, "", "utf8");
+  db.prepare(
+    `INSERT INTO runs (
+      id,
+      project_id,
+      work_order_id,
+      provider,
+      status,
+      branch_name,
+      source_branch,
+      reviewer_verdict,
+      summary,
+      run_dir,
+      log_path,
+      created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    runId,
+    projectId,
+    "WO-200",
+    "codex",
+    "approved",
+    branchName,
+    baseBranch,
+    "approved",
+    "summary-wtcommit",
+    runDir,
+    logPath,
+    now
+  );
+
+  const result = approveRunMerge(runId);
+  assert.equal(result.ok, true, `approveRunMerge failed: ${result.error ?? ""}`);
+
+  const runRow = db
+    .prepare("SELECT status, merge_status FROM runs WHERE id = ?")
+    .get(runId);
+  assert.equal(runRow.status, "you_review");
+  assert.equal(runRow.merge_status, "merged");
+
+  // The builder's change must be present in the base branch after merge
+  const baseContent = runGit(repoPath, ["show", `${baseBranch}:app.txt`]);
+  assert.match(baseContent, /builder-change/);
+});
+
 test("rejectRun abandons approved runs and cleans local worktree artifacts", () => {
   const fixture = createApprovedRunFixture("reject");
   const worktreePath = path.join(fixture.runDir, "worktree");

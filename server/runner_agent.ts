@@ -4332,63 +4332,10 @@ export async function runRun(runId: string) {
       });
     };
 
-    const mergePolicyResult = applyMergePolicyAfterApproval({
-      runId,
-      mergePolicy: project.merge_policy,
-      repoPath,
-      worktreePath,
-      baseBranch,
-      branchName,
-      workOrderId: workOrder.id,
-      workOrderTitle: workOrder.title,
-      approvedSummary,
-      reviewerNotes,
-      log,
-    });
-    if (mergePolicyResult === "human_approve") {
-      recordMergeOutcome("approved", { policy: "human_approve" });
-      log("Run moved to approved status and is waiting for manual merge.");
-      return;
-    }
-    if (mergePolicyResult === "pr_open") {
-      recordMergeOutcome("approved", { policy: "pull_request" });
-      log("Run moved to pr_open status and is waiting for GitHub merge.");
-      return;
-    }
-
-    updateRun(runId, { merge_status: "pending", pr_url: null });
-    log("Preparing merge to main");
-
-    try {
-      patchWorkOrder(worktreePath, run.work_order_id, { status: "you_review" });
-    } catch {
-      // ignore
-    }
-
-    const finishMergeConflict = (
-      message: string,
-      conflictRunId: string | null,
-      conflictFiles: string[],
-      reason = "merge_conflict"
-    ) => {
-      const finishedAt = nowIso();
-      updateRun(runId, {
-        status: "merge_conflict",
-        merge_status: "conflict",
-        conflict_with_run_id: conflictRunId,
-        error: message,
-        finished_at: finishedAt,
-        reviewer_verdict: "approved",
-        reviewer_notes: JSON.stringify(reviewerNotes),
-        summary: approvedSummary,
-      });
-      recordMergeOutcome("failed", { reason });
-      log(`Merge conflict: ${message}`);
-      if (conflictFiles.length) {
-        writeJson(path.join(runDir, "conflict_files.json"), conflictFiles);
-      }
-    };
-
+    // Commit the builder's work onto the run branch before the merge-policy gate.
+    // All three policies (auto_merge, human_approve, pull_request) need a committed
+    // branch — without this, manual-merge paths would operate on an empty branch
+    // and destroy the uncommitted changes when the worktree is cleaned up.
     const skipCommit = resumeIndex >= phaseIndex("committed");
     if (!skipCommit) {
       const statusOutput = runGit(["status", "--porcelain"], {
@@ -4521,6 +4468,63 @@ export async function runRun(runId: string) {
     } else {
       log("Skipping commit (already committed in previous attempt)");
     }
+
+    const mergePolicyResult = applyMergePolicyAfterApproval({
+      runId,
+      mergePolicy: project.merge_policy,
+      repoPath,
+      worktreePath,
+      baseBranch,
+      branchName,
+      workOrderId: workOrder.id,
+      workOrderTitle: workOrder.title,
+      approvedSummary,
+      reviewerNotes,
+      log,
+    });
+    if (mergePolicyResult === "human_approve") {
+      recordMergeOutcome("approved", { policy: "human_approve" });
+      log("Run moved to approved status and is waiting for manual merge.");
+      return;
+    }
+    if (mergePolicyResult === "pr_open") {
+      recordMergeOutcome("approved", { policy: "pull_request" });
+      log("Run moved to pr_open status and is waiting for GitHub merge.");
+      return;
+    }
+
+    updateRun(runId, { merge_status: "pending", pr_url: null });
+    log("Preparing merge to main");
+
+    try {
+      patchWorkOrder(worktreePath, run.work_order_id, { status: "you_review" });
+    } catch {
+      // ignore
+    }
+
+    const finishMergeConflict = (
+      message: string,
+      conflictRunId: string | null,
+      conflictFiles: string[],
+      reason = "merge_conflict"
+    ) => {
+      const finishedAt = nowIso();
+      updateRun(runId, {
+        status: "merge_conflict",
+        merge_status: "conflict",
+        conflict_with_run_id: conflictRunId,
+        error: message,
+        finished_at: finishedAt,
+        reviewer_verdict: "approved",
+        reviewer_notes: JSON.stringify(reviewerNotes),
+        summary: approvedSummary,
+      });
+      recordMergeOutcome("failed", { reason });
+      log(`Merge conflict: ${message}`);
+      if (conflictFiles.length) {
+        writeJson(path.join(runDir, "conflict_files.json"), conflictFiles);
+      }
+    };
 
     let conflictRunId: string | null = null;
     let conflictFiles: string[] = [];
@@ -5759,12 +5763,6 @@ export function approveRunMerge(runId: string): ApproveRunMergeResult {
       return { ok: false, error: message, code: "merge_conflict" };
     }
 
-    try {
-      patchWorkOrder(worktreePath, run.work_order_id, { status: "you_review" });
-    } catch {
-      // ignore
-    }
-
     cleanupWorktree({
       repoPath,
       worktreePath,
@@ -5772,6 +5770,14 @@ export function approveRunMerge(runId: string): ApproveRunMergeResult {
       branchName,
       log,
     });
+
+    // Patch the WO status in the main repo (repoPath) after the merge has landed,
+    // not in the worktree which has already been removed above.
+    try {
+      patchWorkOrder(repoPath, run.work_order_id, { status: "you_review" });
+    } catch {
+      // ignore
+    }
 
     const finishedAt = nowIso();
     updateRun(runId, {
