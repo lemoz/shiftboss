@@ -45,11 +45,27 @@ function waitForThreadPatch(page: import("@playwright/test").Page, threadId: str
   );
 }
 
+/**
+ * Returns true for the benign Next.js RSC prefetch-fallback message that fires
+ * when a page.reload() races with an in-flight RSC link prefetch.  The router
+ * recovers automatically (falls back to a full browser navigation), so this
+ * noise must be filtered rather than treated as a test failure.
+ *
+ * Deliberately narrow: only matches messages with both the "Failed to fetch RSC
+ * payload" prefix AND the "Falling back to browser navigation" suffix so that
+ * genuine fetch errors are still caught.
+ */
+function isBenignNextNoise(text: string): boolean {
+  return /Failed to fetch RSC payload .* Falling back to browser navigation/.test(text);
+}
+
 function trackPageErrors(page: import("@playwright/test").Page) {
   const errors: string[] = [];
-  page.on("pageerror", (err) => errors.push(err.message));
+  page.on("pageerror", (err) => {
+    if (!isBenignNextNoise(err.message)) errors.push(err.message);
+  });
   page.on("console", (msg) => {
-    if (msg.type() === "error") errors.push(msg.text());
+    if (msg.type() === "error" && !isBenignNextNoise(msg.text())) errors.push(msg.text());
   });
   return errors;
 }
@@ -98,7 +114,7 @@ test.describe("Shiftboss smoke", () => {
 
   test("Portfolio loads without crashing", async ({ page }) => {
     const errors = trackPageErrors(page);
-    await page.goto("/");
+    await page.goto("/portfolio");
     await expect(page.getByRole("heading", { name: "Portfolio" })).toBeVisible();
     expect(errors, `Console/page errors: ${errors.join("\n")}`).toEqual([]);
   });
@@ -116,7 +132,8 @@ test.describe("Shiftboss smoke", () => {
 
     for (const viewport of requiredViewports) {
       await page.setViewportSize(viewport);
-      await page.goto("/", { waitUntil: "networkidle" });
+      await page.goto("/");
+      await expect(page.locator(".nav-links")).toBeVisible();
 
       const navMetrics = await page.evaluate(() => {
         const container = document.querySelector(".nav-links");
@@ -146,7 +163,8 @@ test.describe("Shiftboss smoke", () => {
 
     for (const viewport of requiredPortraitViewports) {
       await page.setViewportSize(viewport);
-      await page.goto("/", { waitUntil: "networkidle" });
+      await page.goto("/");
+      await expect(page.locator(".nav-links")).toBeVisible();
 
       const navStyles = await page.evaluate(() => {
         const navBar = document.querySelector(".nav-bar");
@@ -170,7 +188,8 @@ test.describe("Shiftboss smoke", () => {
     await page.setViewportSize({ width: 390, height: 844 });
     const globalNav = page.locator(".nav-links");
     for (const { href, label } of GLOBAL_NAV_LINKS) {
-      await page.goto(href, { waitUntil: "networkidle" });
+      await page.goto(href);
+      await expect(page.locator(".nav-links")).toBeVisible();
       await expect(globalNav.getByRole("link", { name: label })).toHaveAttribute(
         "aria-current",
         "page"
@@ -179,18 +198,18 @@ test.describe("Shiftboss smoke", () => {
   });
 
   test("Sidecar metadata renders on repo card", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/portfolio");
     const alphaCard = page.locator(".grid .card.cardLink", { hasText: "alpha" });
     await expect(alphaCard.getByText("long_term")).toBeVisible();
     await expect(alphaCard.getByText("building")).toBeVisible();
-    await expect(alphaCard.getByText("active")).toBeVisible();
+    await expect(alphaCard.getByText("active").first()).toBeVisible();
     await expect(alphaCard.getByText("p2")).toBeVisible();
     await expect(alphaCard.getByText("demo")).toBeVisible();
     await expect(alphaCard.getByText("sidecar")).toBeVisible();
   });
 
   test("Star/unstar reorder persists after refresh", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/portfolio");
     await page.waitForLoadState("networkidle");
     const cards = page.locator(".grid .card.cardLink");
 
@@ -220,7 +239,7 @@ test.describe("Shiftboss smoke", () => {
   });
 
   test("Star persists across repo ID migration", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/portfolio");
     await page.waitForLoadState("networkidle");
     const cards = page.locator(".grid .card.cardLink");
 
@@ -269,7 +288,7 @@ test.describe("Shiftboss smoke", () => {
     const betaControlPath = path.join(betaRepoPath, ".control.yml");
 
     fs.writeFileSync(betaControlPath, "id: beta-stable\n", "utf8");
-    await page.goto("/");
+    await page.goto("/portfolio");
 
     const db = new Database(dbPath);
     const now = new Date().toISOString();
@@ -347,7 +366,7 @@ test.describe("Shiftboss smoke", () => {
     const betaControlPath = path.join(betaRepoPath, ".control.yml");
 
     fs.writeFileSync(betaControlPath, "id: beta-stable\n", "utf8");
-    await page.goto("/");
+    await page.goto("/portfolio");
     await page.waitForLoadState("networkidle");
 
     const betaCard = page.locator(".grid .card.cardLink", { hasText: "beta" });
@@ -401,7 +420,7 @@ test.describe("Shiftboss smoke", () => {
     const betaControlPath = path.join(betaRepoPath, ".control.yml");
 
     fs.writeFileSync(betaControlPath, "id: beta-stable\n", "utf8");
-    await page.goto("/");
+    await page.goto("/portfolio");
 
     const db = new Database(dbPath);
     db.prepare("UPDATE projects SET tags = ? WHERE path = ?").run(
@@ -465,7 +484,7 @@ test.describe("Shiftboss smoke", () => {
   });
 
   test("Project page renders Kanban columns", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/portfolio");
     const alphaCard = page.locator(".grid .card.cardLink", { hasText: "alpha" });
     await alphaCard.locator("a.stretchedLink").click();
 
@@ -479,7 +498,7 @@ test.describe("Shiftboss smoke", () => {
 
   test("Server offline fallback renders", async ({ page }) => {
     const offlinePort = Number(process.env.E2E_OFFLINE_WEB_PORT || 3013);
-    await page.goto(`http://localhost:${offlinePort}/`);
+    await page.goto(`http://localhost:${offlinePort}/portfolio`);
     await expect(page.getByRole("heading", { name: "Portfolio" })).toBeVisible();
     await expect(page.getByText("server offline or empty")).toBeVisible();
     await expect(page.getByText("No repos yet")).toBeVisible();
