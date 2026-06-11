@@ -66,7 +66,16 @@ function trimEnvValue(value: string | undefined): string | null {
 let warnedLegacyDatabaseFile = false;
 
 function resolveDatabasePath(): string {
-  const raw = (readEnv("SHIFTBOSS_DB_PATH", "PCC_DATABASE_PATH") || "").trim();
+  // Preserve pre-rename precedence: SHIFTBOSS_DB_PATH > PCC_DATABASE_PATH >
+  // CONTROL_CENTER_DB_PATH. readEnv auto-inserts legacy prefixes (including
+  // CONTROL_CENTER_) before explicit legacyNames, which would flip the order
+  // for the two legacy vars — so we read them explicitly instead.
+  const raw = (
+    process.env.SHIFTBOSS_DB_PATH ||
+    process.env.PCC_DATABASE_PATH ||
+    process.env.CONTROL_CENTER_DB_PATH ||
+    ""
+  ).trim();
   if (raw) {
     return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
   }
@@ -139,11 +148,11 @@ export function getServerHost(): string {
 }
 
 export function getAllowLan(): boolean {
-  return readEnv("SHIFTBOSS_ALLOW_LAN") === "1";
+  return isTruthyEnv(readEnv("SHIFTBOSS_ALLOW_LAN"));
 }
 
 export function getAllowRemoteHealth(): boolean {
-  return readEnv("SHIFTBOSS_ALLOW_REMOTE_HEALTH") === "1";
+  return isTruthyEnv(readEnv("SHIFTBOSS_ALLOW_REMOTE_HEALTH"));
 }
 
 export function getHealthToken(): string {
@@ -204,7 +213,7 @@ export function getReviewerSandboxMode(): SandboxMode {
 }
 
 export function getCorsAllowAllRequested(): boolean {
-  return readEnv("SHIFTBOSS_CORS_ALLOW_ALL") === "1";
+  return isTruthyEnv(readEnv("SHIFTBOSS_CORS_ALLOW_ALL"));
 }
 
 export function getAllowedOrigins(): string[] {
@@ -224,7 +233,7 @@ export function isProductionEnv(): boolean {
 }
 
 export function getFailRunsOnRestart(): boolean {
-  return readEnv("SHIFTBOSS_FAIL_IN_PROGRESS_ON_RESTART") === "1";
+  return isTruthyEnv(readEnv("SHIFTBOSS_FAIL_IN_PROGRESS_ON_RESTART"));
 }
 
 export function getElevenLabsWebhookSecret(): string | null {
@@ -407,7 +416,8 @@ export function getPathExtEnv(): string {
 export function getScanTtlMs(): number {
   const raw = readEnv("SHIFTBOSS_SCAN_TTL_MS");
   if (raw === undefined || raw === "") return 60_000;
-  return Number(raw);
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 60_000;
 }
 
 export function getControlCenterApiUrl(): string | null {
@@ -505,7 +515,7 @@ export function getChatSuggestionContextMessageLimit(): number {
 }
 
 export function getUseTsWorker(): boolean {
-  return readEnv("SHIFTBOSS_USE_TS_WORKER") === "1";
+  return isTruthyEnv(readEnv("SHIFTBOSS_USE_TS_WORKER"));
 }
 
 export function getRemoteTestTimeoutSeconds(): number {
