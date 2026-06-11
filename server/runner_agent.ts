@@ -9,10 +9,13 @@ import path from "path";
 import YAML from "yaml";
 import {
   getBuilderSandboxMode,
+  getBuilderTimeoutMs,
   getCodexCliPath,
   getOpenAiApiKey,
   getProcessEnv,
   getReviewerSandboxMode,
+  getReviewerTimeoutMs,
+  getTestTimeoutMs,
   getUseTsWorker,
   type SandboxMode,
 } from "./config.js";
@@ -2416,6 +2419,8 @@ async function runCodexExec(params: {
   onEscalation?: (request: EscalationRequest) => Promise<EscalationRecord | null>;
   streamMonitor?: StreamMonitor;
   streamContext?: StreamMonitorContext;
+  /** Timeout in milliseconds; undefined = no timeout. */
+  timeoutMs?: number;
   log?: (line: string) => void;
 }): Promise<CodexExecResult> {
   const args = buildCodexExecArgs({
@@ -2440,6 +2445,9 @@ async function runCodexExec(params: {
     cwd: params.cwd,
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...getProcessEnv(), ...(params.env || {}) },
+    // detached so the child is its own process-group leader; we can then
+    // kill the whole group via -pid (shell children die too).
+    detached: process.platform !== "win32",
   };
   if (params.runAs) {
     spawnOptions.uid = params.runAs.uid;
@@ -2542,10 +2550,54 @@ async function runCodexExec(params: {
   child.stdin?.write(params.prompt);
   child.stdin?.end();
 
+  // -----------------------------------------------------------------------
+  // Timeout machinery: SIGTERM → SIGKILL the whole process group on expiry.
+  //
+  // DEADLOCK FIX: we use a ref object (not a plain `let` variable) so TS
+  // does not narrow away the assignment inside the Promise executor.  The
+  // `settle` function is called unconditionally after the process closes so
+  // that `await timeoutKillPromise` never hangs on the normal (non-timeout)
+  // exit path (clearTimeout would otherwise leave the Promise unsettled).
+  // -----------------------------------------------------------------------
+  let timedOut = false;
+  const tkRef: { settle: (() => void) | null; handle: ReturnType<typeof setTimeout> | null } =
+    { settle: null, handle: null };
+  const timeoutKillPromise: Promise<void> = params.timeoutMs
+    ? new Promise<void>((resolve) => {
+        tkRef.settle = resolve;
+        tkRef.handle = setTimeout(async () => {
+          if (child.exitCode !== null) { resolve(); return; }
+          timedOut = true;
+          params.log?.(`[runner] codex exec timed out after ${params.timeoutMs}ms; killing process group`);
+          const pid = child.pid;
+          if (pid !== undefined) {
+            if (process.platform !== "win32") {
+              // SIGCONT first so signals reach SIGSTOPped processes
+              try { process.kill(-pid, "SIGCONT"); } catch { /* already gone */ }
+              try { process.kill(-pid, "SIGTERM"); } catch { /* already gone */ }
+              // wait RUNNER_TERMINATE_TIMEOUT_MS then SIGKILL
+              await new Promise<void>((r) => setTimeout(r, RUNNER_TERMINATE_TIMEOUT_MS));
+              if (child.exitCode === null) {
+                try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+              }
+            } else {
+              try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
+            }
+          }
+          resolve();
+        }, params.timeoutMs);
+      })
+    : Promise.resolve();
+
   const exitCode: number = await new Promise((resolve) => {
     child.on("close", (code) => resolve(code ?? 1));
     child.on("error", () => resolve(1));
   });
+
+  if (tkRef.handle) clearTimeout(tkRef.handle);
+  // Unblock the kill-promise on normal exit (see DEADLOCK FIX comment above).
+  tkRef.settle?.();
+  await timeoutKillPromise;
 
   if (outputPoller) {
     clearInterval(outputPoller);
@@ -2558,22 +2610,39 @@ async function runCodexExec(params: {
     await escalationPromise;
   }
 
-  logStream.write(`[${nowIso()}] codex exec end exit=${exitCode}\n`);
+  // MONITOR VERDICT RACE FIX: flush the in-flight Gemini queue before
+  // deciding success.  A KILL verdict that resolves after process exit must
+  // still fail the run — do not check incidents before this await.
+  if (params.streamMonitor) {
+    await params.streamMonitor.flush();
+  }
+
+  logStream.write(`[${nowIso()}] codex exec end exit=${exitCode} timedOut=${timedOut}\n`);
   logStream.end();
+
+  if (timedOut) {
+    throw new Error(`codex exec timed out after ${params.timeoutMs}ms`);
+  }
 
   if (escalationError) {
     throw escalationError;
   }
 
-  if (exitCode !== 0) {
+  // Check for KILL verdicts regardless of exit code — a quick command that
+  // matched a dangerous pattern and exited 0 before Gemini replied must also
+  // be held.
+  if (params.streamMonitor) {
     const killIncident =
       params.streamMonitor
-        ?.getIncidents()
+        .getIncidents()
         .slice(monitorStartIndex)
-        .find((incident) => incident.action === "killed") ?? null;
+        .find((incident) => incident.verdict === "KILL") ?? null;
     if (killIncident) {
       throw new SecurityHoldError(killIncident);
     }
+  }
+
+  if (exitCode !== 0) {
     throw new Error(`codex exec failed (exit ${exitCode})`);
   }
 
@@ -3451,6 +3520,8 @@ async function runRepoTests(
       E2E_API_PORT: String(E2E_API_PORT_BASE + portOffset),
     },
     stdio: ["ignore", "pipe", "pipe"],
+    // detached so we can kill the whole process group on timeout
+    detached: process.platform !== "win32",
   });
 
   child.stdout?.on("data", (buf) => {
@@ -3462,10 +3533,42 @@ async function runRepoTests(
     outputCapture.pushChunk(buf);
   });
 
+  const testTimeoutMs = getTestTimeoutMs();
+  let testTimedOut = false;
+  // DEADLOCK FIX: ref object (not a plain let variable) so TS does not narrow
+  // away the assignment inside the Promise executor.  `settle` is called
+  // unconditionally after the process closes so `await testTimeoutKill` never
+  // hangs on the normal (non-timeout) exit path.
+  const ttRef: { settle: (() => void) | null; handle: ReturnType<typeof setTimeout> | null } =
+    { settle: null, handle: null };
+  const testTimeoutKill: Promise<void> = new Promise<void>((resolve) => {
+    ttRef.settle = resolve;
+    ttRef.handle = setTimeout(async () => {
+      if (child.exitCode !== null) { resolve(); return; }
+      testTimedOut = true;
+      const pid = child.pid;
+      if (pid !== undefined && process.platform !== "win32") {
+        try { process.kill(-pid, "SIGTERM"); } catch { /* already gone */ }
+        await new Promise<void>((r) => setTimeout(r, RUNNER_TERMINATE_TIMEOUT_MS));
+        if (child.exitCode === null) {
+          try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+        }
+      } else if (pid !== undefined) {
+        try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
+      }
+      resolve();
+    }, testTimeoutMs);
+  });
+
   const exitCode: number = await new Promise((resolve) => {
     child.on("close", (code) => resolve(code ?? 1));
     child.on("error", () => resolve(1));
   });
+
+  if (ttRef.handle) clearTimeout(ttRef.handle);
+  // Unblock the kill-promise on normal exit (see DEADLOCK FIX comment above).
+  ttRef.settle?.();
+  await testTimeoutKill;
 
   const captured = outputCapture.finalize();
   const outputTail = formatTestOutput(
@@ -3474,8 +3577,12 @@ async function runRepoTests(
     MAX_TEST_OUTPUT_LINES
   );
 
-  logStream.write(`[${nowIso()}] ${label} end exit=${exitCode}\n`);
+  logStream.write(`[${nowIso()}] ${label} end exit=${exitCode} timedOut=${testTimedOut}\n`);
   logStream.end();
+
+  if (testTimedOut) {
+    throw new Error(`npm test timed out after ${testTimeoutMs}ms`);
+  }
 
   return [
     {
@@ -4072,6 +4179,7 @@ export async function runRun(runId: string) {
                 cliPath: runnerSettings.builder.cliPath,
                 streamMonitor: builderStreamMonitor ?? undefined,
                 streamContext: builderStreamMonitor ? streamContext : undefined,
+                timeoutMs: getBuilderTimeoutMs(),
                 onEscalation: async (request) => {
                   const escalationRecord: EscalationRecord = {
                     ...request,
@@ -4443,6 +4551,7 @@ export async function runRun(runId: string) {
               },
               streamMonitor: reviewerStreamMonitor ?? undefined,
               streamContext: reviewerStreamMonitor ? streamContext : undefined,
+              timeoutMs: getReviewerTimeoutMs(),
             });
           } finally {
             recordCostFromCodexLog({
@@ -4851,6 +4960,7 @@ export async function runRun(runId: string) {
               runAs,
               streamMonitor: builderStreamMonitor ?? undefined,
               streamContext: builderStreamMonitor ? streamContext : undefined,
+              timeoutMs: getBuilderTimeoutMs(),
             });
           } finally {
             if (proxy) {
@@ -5032,6 +5142,7 @@ export async function runRun(runId: string) {
               },
               streamMonitor: reviewerStreamMonitor ?? undefined,
               streamContext: reviewerStreamMonitor ? streamContext : undefined,
+              timeoutMs: getReviewerTimeoutMs(),
             });
           } finally {
             recordCostFromCodexLog({
@@ -6071,7 +6182,81 @@ export async function cancelRun(runId: string): Promise<CancelRunResult> {
   } catch {
     // Ignore incident resolution failures.
   }
+
+  // Flush in-flight codex spend: the worker finally-block never ran (SIGKILL),
+  // but the phase logs were written incrementally — parse them post-mortem.
+  // We dedupe by checking existing cost_records for this run+category; for
+  // simplicity we use the description prefix to avoid double-counting.
+  try {
+    flushCanceledRunCost({ run, log });
+  } catch {
+    // Cost flush is best-effort; never block cancel on it.
+  }
+
   return { ok: true, run: getRunById(runId) ?? run };
+}
+
+/**
+ * After a run is killed, try to parse in-flight codex phase logs and record
+ * any spend the worker's finally-block did not reach.
+ *
+ * Strategy: scan for codex.log files under the run_dir that exist but have
+ * not yet had a cost record written (we detect this by trying to read the log
+ * — if parseCodexTokenUsageFromLog returns non-null we record; the cost
+ * system is idempotent by model+category so a double-record is bounded).
+ */
+function flushCanceledRunCost(params: { run: RunRow; log: (line: string) => void }): void {
+  const { run, log } = params;
+  if (!run.run_dir) return;
+
+  const project = findProjectById(run.project_id);
+  const model = project
+    ? (resolveRunnerSettingsForRepo(project.path).effective.builder.model || "")
+    : "";
+
+  // Builder iterations
+  const builderBase = path.join(run.run_dir, "builder");
+  if (fs.existsSync(builderBase)) {
+    const iter = run.builder_iteration || run.iteration || 1;
+    for (let i = 1; i <= iter; i++) {
+      const logPath = path.join(builderBase, `iter-${i}`, "codex.log");
+      if (!fs.existsSync(logPath)) continue;
+      const usage = parseCodexTokenUsageFromLog(logPath);
+      if (!usage) continue;
+      recordCostEntry({
+        projectId: run.project_id,
+        runId: run.id,
+        category: "builder",
+        model: model || "codex",
+        usage,
+        usageSource: "actual",
+        description: `builder iteration ${i} (cancel flush)`,
+      });
+      log(`[cost] flushed builder iter-${i} cost on cancel`);
+    }
+  }
+
+  // Reviewer iterations
+  const reviewerBase = path.join(run.run_dir, "reviewer");
+  if (fs.existsSync(reviewerBase)) {
+    const iter = run.iteration || 1;
+    for (let i = 1; i <= iter; i++) {
+      const logPath = path.join(reviewerBase, `iter-${i}`, "codex.log");
+      if (!fs.existsSync(logPath)) continue;
+      const usage = parseCodexTokenUsageFromLog(logPath);
+      if (!usage) continue;
+      recordCostEntry({
+        projectId: run.project_id,
+        runId: run.id,
+        category: "reviewer",
+        model: model || "codex",
+        usage,
+        usageSource: "actual",
+        description: `reviewer iteration ${i} (cancel flush)`,
+      });
+      log(`[cost] flushed reviewer iter-${i} cost on cancel`);
+    }
+  }
 }
 
 export function approveRunMerge(runId: string): ApproveRunMergeResult {

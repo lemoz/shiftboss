@@ -1,7 +1,11 @@
-import { spawn, spawnSync } from "child_process";
+import { spawnSync } from "child_process";
+import { executeAgentCli } from "./agent_execution.js";
 import fs from "fs";
 import path from "path";
-import { getGlobalAttentionMaxProjects } from "./config.js";
+import {
+  getGlobalAgentDecideTimeoutMs,
+  getGlobalAttentionMaxProjects,
+} from "./config.js";
 import {
   createGlobalShiftHandoff,
   expireStaleGlobalShifts,
@@ -13,6 +17,7 @@ import {
   startShift,
   updateEscalation,
   updateGlobalShift,
+  updateGlobalShiftIfActive,
   updateProjectCommunication,
   updateProjectLifecycleStatus,
   updateRun,
@@ -326,7 +331,8 @@ async function decideWithClaude(options: {
   cwd?: string;
   onLog?: (line: string) => void;
   logPath?: string;
-}): Promise<string> {
+  timeoutMs?: number;
+}): Promise<{ result: string; raw: string }> {
   const command = options.claudePath?.trim() || "claude";
   const args = [
     "--dangerously-skip-permissions",
@@ -346,35 +352,39 @@ async function decideWithClaude(options: {
     logStream = fs.createWriteStream(options.logPath, { flags: "w" });
   }
 
-  return new Promise<string>((resolve, reject) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd ?? process.cwd(),
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdoutChunks.push(chunk);
-      if (logStream) logStream.write(chunk);
-    });
-    child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
-    child.on("error", (err) => {
-      if (logStream) logStream.end();
-      reject(err);
-    });
-    child.on("close", (code) => {
-      if (logStream) logStream.end();
-      const status = code ?? 1;
-      if (status !== 0) {
-        const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-        const detail = stderr ? `: ${stderr}` : "";
-        reject(new Error(`claude exited ${status}${detail}`));
-        return;
+  const timeoutMs = options.timeoutMs ?? getGlobalAgentDecideTimeoutMs();
+
+  // Route through the shared executeAgentCli abstraction so the process-group
+  // kill, SIGCONT-before-SIGTERM, and deadlock-free timeout machinery are all
+  // in one place.  The logStream is written via onCost (which fires after all
+  // output is captured) so we preserve the existing log-file behaviour.
+  const result = await executeAgentCli({
+    command,
+    args,
+    cwd: options.cwd,
+    timeoutMs,
+    label: "decideWithClaude",
+    log: options.onLog,
+    onCost: (info) => {
+      if (logStream) {
+        logStream.write(info.stdout);
+        logStream.end();
       }
-      const raw = Buffer.concat(stdoutChunks).toString("utf8");
-      resolve(extractResultFromStreamJson(raw));
-    });
+    },
   });
+
+  if (result.timedOut) {
+    throw new Error(`decideWithClaude timed out after ${timeoutMs}ms`);
+  }
+
+  if (result.exitCode !== 0) {
+    const stderr = result.cost.stderr.trim();
+    const detail = stderr ? `: ${stderr}` : "";
+    throw new Error(`claude exited ${result.exitCode}${detail}`);
+  }
+
+  const raw = result.cost.stdout;
+  return { result: extractResultFromStreamJson(raw), raw };
 }
 
 function toResolutionPayload(
@@ -975,17 +985,28 @@ export async function runGlobalAgentShift(
         attention,
         session: options.session,
       });
-      const decider = options.decide
-        ? options.decide
-        : async (value: string) =>
-            decideWithClaude({
-              prompt: value,
-              claudePath: options.claudePath,
-              cwd: options.cwd,
-              onLog: options.onLog,
-              logPath,
-            });
-      const decisionOutput = await decider(prompt);
+      let decisionOutput: string | GlobalAgentDecision;
+      if (options.decide) {
+        decisionOutput = await options.decide(prompt);
+      } else {
+        const claudeResult = await decideWithClaude({
+          prompt,
+          claudePath: options.claudePath,
+          cwd: options.cwd,
+          onLog: options.onLog,
+          logPath,
+        });
+        decisionOutput = claudeResult.result;
+        // Record cost for this claude invocation.  Global shifts have no
+        // project_id, so we record against a null run with category 'other'.
+        // cost_records.project_id is NOT NULL, so we skip recording when there
+        // is no projectId available — a dedicated global-bucket WO is tracked
+        // in WO-2026-101 as a follow-up schema change.
+        // Cost recording is intentionally skipped here: global shifts span all
+        // projects and cost_records.project_id IS NOT NULL (schema constraint),
+        // so there is no valid project to record against.  A global-bucket
+        // pseudo-project is tracked in WO-2026-101.
+      }
       const decision =
         typeof decisionOutput === "string"
           ? parseGlobalDecision(decisionOutput)
@@ -1050,16 +1071,22 @@ export async function runGlobalAgentShift(
     handoff_id: handoff?.id ?? null,
     error: error ? error.message : null,
   };
-  const updatedOk = updateGlobalShift(shift.id, {
+  // Use updateGlobalShiftIfActive so a zombie run that finishes after the
+  // shift was force-expired cannot overwrite 'expired' with 'completed'.
+  // 0 rows changed means the shift was already force-expired (the intended
+  // guard): discard our result silently — this is NOT an error.
+  const updatedOk = updateGlobalShiftIfActive(shift.id, {
     status: updatedShift.status,
     completed_at: updatedShift.completed_at,
     handoff_id: updatedShift.handoff_id,
     error: updatedShift.error,
   });
-  if (!updatedOk && !error) {
-    error = new Error("failed to update global shift");
-    updatedShift.status = "failed";
-    updatedShift.error = error.message;
+  if (!updatedOk && !error && handoff) {
+    // Shift was force-expired by a recovered loop before we could write our
+    // result.  The work we did is stale — discard it and return ok:true so
+    // the session loop does not pause on what is a normal concurrent-expiry
+    // scenario, not a failure.
+    return { ok: true, shift: updatedShift, handoff, actions };
   }
 
   expireStaleGlobalShifts();

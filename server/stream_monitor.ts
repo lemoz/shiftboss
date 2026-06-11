@@ -428,6 +428,29 @@ export class StreamMonitor {
     return [...this.incidents];
   }
 
+  /**
+   * Wait for the in-flight Gemini verdict queue to drain.
+   *
+   * Call this after the monitored process exits but BEFORE deciding whether
+   * the run succeeded.  A KILL verdict that resolves after process exit must
+   * still fail the run — awaiting flush() closes that race.
+   */
+  async flush(): Promise<void> {
+    if (!this.processing) return;
+    // processQueue() sets this.processing = false when the queue is empty.
+    // Poll until it settles.
+    await new Promise<void>((resolve) => {
+      const check = () => {
+        if (!this.processing) {
+          resolve();
+          return;
+        }
+        setTimeout(check, 20);
+      };
+      check();
+    });
+  }
+
   reportNetworkViolation(details: {
     domain: string;
     path: string;
@@ -520,9 +543,22 @@ export class StreamMonitor {
       verdict = await requestGeminiVerdict(prompt);
       geminiLatencyMs = Date.now() - startedAt;
       if (verdict.verdict === "KILL" && this.autoKillOnThreat) {
-        if (incident.child.pid && incident.child.exitCode === null) {
+        if (incident.child.pid !== undefined && incident.child.pid !== null) {
+          const pid = incident.child.pid;
           try {
-            process.kill(incident.child.pid, "SIGKILL");
+            if (incident.child.exitCode === null) {
+              // SIGCONT first in case the process is SIGSTOPped (signals don't
+              // deliver to stopped processes).  Then kill the whole process group
+              // (-pid) so shell children spawned by the CLI are also terminated.
+              if (process.platform !== "win32") {
+                try { process.kill(-pid, "SIGCONT"); } catch { /* already gone */ }
+                process.kill(-pid, "SIGKILL");
+              } else {
+                process.kill(pid, "SIGKILL");
+              }
+            }
+            // Record kill even if process already exited — a KILL verdict landing
+            // after exit must still be visible to the verdict-race check.
             action = "killed";
           } catch {
             action = "error";

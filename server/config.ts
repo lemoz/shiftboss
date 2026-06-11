@@ -236,6 +236,56 @@ export function getFailRunsOnRestart(): boolean {
   return isTruthyEnv(readEnv("SHIFTBOSS_FAIL_IN_PROGRESS_ON_RESTART"));
 }
 
+// ---------------------------------------------------------------------------
+// Agent execution timeouts
+// ---------------------------------------------------------------------------
+// All values are in seconds; the helper converts to milliseconds for callers.
+
+const DEFAULT_BUILDER_TIMEOUT_SEC = 45 * 60; // 45 min
+const DEFAULT_TEST_TIMEOUT_SEC = 20 * 60;    // 20 min
+const DEFAULT_REVIEWER_TIMEOUT_SEC = 15 * 60; // 15 min
+const DEFAULT_GLOBAL_AGENT_TIMEOUT_SEC = 60;   // 60 s (matches existing helper convention)
+
+function parseTimeoutSec(
+  raw: string | undefined,
+  fallbackSec: number
+): number {
+  if (!raw) return fallbackSec;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackSec;
+}
+
+/** Timeout for codex builder CLI exec (ms). */
+export function getBuilderTimeoutMs(): number {
+  return (
+    parseTimeoutSec(readEnv("SHIFTBOSS_BUILDER_TIMEOUT_SEC"), DEFAULT_BUILDER_TIMEOUT_SEC) * 1000
+  );
+}
+
+/** Timeout for npm-test subprocess (ms). */
+export function getTestTimeoutMs(): number {
+  return (
+    parseTimeoutSec(readEnv("SHIFTBOSS_TEST_TIMEOUT_SEC"), DEFAULT_TEST_TIMEOUT_SEC) * 1000
+  );
+}
+
+/** Timeout for codex reviewer CLI exec (ms). */
+export function getReviewerTimeoutMs(): number {
+  return (
+    parseTimeoutSec(readEnv("SHIFTBOSS_REVIEWER_TIMEOUT_SEC"), DEFAULT_REVIEWER_TIMEOUT_SEC) * 1000
+  );
+}
+
+/** Timeout for global-agent decideWithClaude calls (ms). */
+export function getGlobalAgentDecideTimeoutMs(): number {
+  return (
+    parseTimeoutSec(
+      readEnv("SHIFTBOSS_GLOBAL_AGENT_TIMEOUT_SEC"),
+      DEFAULT_GLOBAL_AGENT_TIMEOUT_SEC
+    ) * 1000
+  );
+}
+
 export function getElevenLabsWebhookSecret(): string | null {
   const raw = readEnv("SHIFTBOSS_ELEVENLABS_WEBHOOK_SECRET");
   if (!raw) return null;
