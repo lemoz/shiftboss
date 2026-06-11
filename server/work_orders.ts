@@ -1,3 +1,4 @@
+import { spawnSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import YAML from "yaml";
@@ -764,12 +765,11 @@ export function createWorkOrder(
 
   // Auto-commit new WO file to keep main clean for merges
   try {
-    const { execSync } = require("child_process");
-    execSync(`git add "${filePath}" && git -c user.name="Shiftboss" -c user.email="shiftboss@local" commit -m "chore(wo): create ${id}"`, {
-      cwd: repoPath,
-      stdio: "ignore",
-      timeout: 10000,
-    });
+    spawnSync("git", ["add", "--", filePath], { cwd: repoPath, stdio: "ignore", timeout: 10000 });
+    const diff = spawnSync("git", ["diff", "--cached", "--quiet"], { cwd: repoPath, stdio: "ignore", timeout: 10000 });
+    if ((diff.status ?? 0) !== 0) {
+      spawnSync("git", ["-c", "user.name=Shiftboss", "-c", "user.email=shiftboss@local", "commit", "-m", `chore(wo): create ${id}`], { cwd: repoPath, stdio: "ignore", timeout: 10000 });
+    }
   } catch {
     // Best-effort
   }
@@ -957,12 +957,11 @@ export function patchWorkOrder(
 
   // Auto-commit WO file changes to keep main clean for merges
   try {
-    const { execSync } = require("child_process");
-    execSync(`git add "${filePath}" && git diff --cached --quiet || git -c user.name="Shiftboss" -c user.email="shiftboss@local" commit -m "chore(wo): update ${workOrderId}"`, {
-      cwd: repoPath,
-      stdio: "ignore",
-      timeout: 10000,
-    });
+    spawnSync("git", ["add", "--", filePath], { cwd: repoPath, stdio: "ignore", timeout: 10000 });
+    const diff = spawnSync("git", ["diff", "--cached", "--quiet"], { cwd: repoPath, stdio: "ignore", timeout: 10000 });
+    if ((diff.status ?? 0) !== 0) {
+      spawnSync("git", ["-c", "user.name=Shiftboss", "-c", "user.email=shiftboss@local", "commit", "-m", `chore(wo): update ${workOrderId}`], { cwd: repoPath, stdio: "ignore", timeout: 10000 });
+    }
   } catch {
     // Best-effort: don't fail the patch if git commit fails
   }
