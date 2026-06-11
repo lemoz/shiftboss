@@ -553,25 +553,32 @@ function parseRecallStatus(payload: unknown): MeetingStatus | null {
   return null;
 }
 
+const RECALL_REQUEST_TIMEOUT_MS = 30_000;
+
 async function requestRecall(params: {
   url: string;
   method: string;
   headers: Record<string, string>;
   body?: unknown;
 }): Promise<{ ok: true; payload: unknown } | { ok: false; status: number; error: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RECALL_REQUEST_TIMEOUT_MS);
   let response: Response;
   try {
     response = await fetch(params.url, {
       method: params.method,
       headers: params.headers,
       body: params.body !== undefined ? JSON.stringify(params.body) : undefined,
+      signal: controller.signal,
     });
   } catch (err) {
     return {
       ok: false,
-      status: 502,
+      status: err instanceof Error && err.name === "AbortError" ? 504 : 502,
       error: err instanceof Error ? err.message : "Recall request failed.",
     };
+  } finally {
+    clearTimeout(timer);
   }
   const text = await response.text().catch(() => "");
   let payload: unknown = null;

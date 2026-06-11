@@ -203,7 +203,7 @@ test("exchangeSlackOAuthCode persists installation for callback flow", async (t)
     return new Response(
       JSON.stringify({
         ok: true,
-        access_token: "xoxb-oauth-token",
+        access_token: "xoxb-fake-oauth-token",
         bot_user_id: "B-OAUTH",
         scope: "chat:write,im:history",
         team: { id: "T-OAUTH", name: "OAuth Team" },
@@ -227,7 +227,7 @@ test("exchangeSlackOAuthCode persists installation for callback flow", async (t)
 
   const persisted = getSlackInstallationByTeam("T-OAUTH");
   assert.ok(persisted);
-  assert.equal(persisted.bot_token, "xoxb-oauth-token");
+  assert.equal(persisted.bot_token, "xoxb-fake-oauth-token");
   assert.equal(persisted.bot_user_id, "B-OAUTH");
   assert.equal(persisted.scope, "chat:write,im:history");
 });

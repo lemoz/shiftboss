@@ -32,7 +32,7 @@ jobs:
 
       # Install dependencies (lockfile keeps versions consistent).
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       # Lint the Next.js app and shared TypeScript.
       - name: Lint
@@ -85,7 +85,7 @@ jobs:
 
       # Install dependencies (lockfile keeps versions consistent).
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       # Install Chromium and its OS-level dependencies for Playwright.
       - name: Install Playwright browsers

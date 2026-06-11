@@ -613,6 +613,10 @@ export function listWorkOrders(repoPath: string): WorkOrder[] {
 function findWorkOrderFileById(repoPath: string, id: string): string | null {
   const dir = workOrdersDir(repoPath);
   if (!fs.existsSync(dir)) return null;
+  // Defense-in-depth: verify the resolved candidate stays inside work_orders/
+  // so that ids like '../../../../etc/hosts' cannot escape the directory.
+  const resolvedDir = path.resolve(dir);
+  if (!path.resolve(resolvedDir, `${id}.md`).startsWith(resolvedDir + path.sep)) return null;
 
   const candidates = [
     path.join(dir, `${id}.md`),
