@@ -2214,7 +2214,7 @@ function spawnChatWorker(runId: string) {
     detached: true,
   });
   child.unref();
-  // Register so the reaper detects a crashed chat worker.
+  // Register so the job supervisor's reaper detects a crashed chat worker.
   if (child.pid) {
     registerJob({ kind: "chat", ref_id: runId, pid: child.pid });
   }
@@ -2222,6 +2222,7 @@ function spawnChatWorker(runId: string) {
 
 function claimRunOrExit(run: ChatRunRow): boolean {
   const db = getDb();
+
   const startedAt = nowIso();
   const result = db
     .prepare(
@@ -2735,3 +2736,4 @@ export async function runChatRun(runId: string): Promise<void> {
     }
   }
 }
+

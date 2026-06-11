@@ -1802,6 +1802,7 @@ function initSchema(database: Database.Database) {
       started_at TEXT,
       finished_at TEXT,
       error TEXT,
+      worker_pid INTEGER,
       FOREIGN KEY (thread_id) REFERENCES chat_threads(id) ON DELETE CASCADE
     );
 
@@ -2534,6 +2535,10 @@ function initSchema(database: Database.Database) {
   }
   if (!hasRunSuggestionAccepted) {
     database.exec("ALTER TABLE chat_runs ADD COLUMN suggestion_accepted INTEGER NOT NULL DEFAULT 0;");
+  }
+  const hasRunWorkerPid = chatRunColumns.some((c) => c.name === "worker_pid");
+  if (!hasRunWorkerPid) {
+    database.exec("ALTER TABLE chat_runs ADD COLUMN worker_pid INTEGER;");
   }
 
   // chat_messages migrations

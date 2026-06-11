@@ -1,6 +1,10 @@
 import { spawnSync } from "child_process";
 import fs from "fs";
 import path from "path";
+import {
+  stageSafeChanges,
+  mergeNoTouch,
+} from "./git_safety.js";
 
 type GitResult = {
   status: number;
@@ -184,18 +188,6 @@ export function buildWorktreeDiff(params: {
   return { diff, hasPendingChanges: status.hasPendingChanges };
 }
 
-function listUnmergedFiles(repoPath: string): string[] {
-  const result = runGit(["diff", "--name-only", "--diff-filter=U"], {
-    cwd: repoPath,
-    allowFailure: true,
-  });
-  return result.stdout
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .sort();
-}
-
 export function cleanupChatWorktree(params: {
   repoPath: string;
   worktreePath: string;
@@ -234,9 +226,16 @@ export function mergeChatWorktree(params: {
   const baseBranch = resolveBaseBranch(params.repoPath);
   const status = readWorktreeStatus(params.worktreePath);
 
-  // If there are uncommitted changes, commit them first
+  // If there are uncommitted changes, stage them safely (no deletions of protected paths)
   if (status.hasPendingChanges) {
-    runGit(["add", "-A"], { cwd: params.worktreePath });
+    const stageResult = stageSafeChanges({ worktreePath: params.worktreePath });
+    if (!stageResult.ok) {
+      const vlist = stageResult.violations.join(", ");
+      throw new Error(
+        `Chat merge aborted: agent deleted protected path(s): ${vlist}. ` +
+        `Restore these files before merging.`
+      );
+    }
     const commitMessage = `Chat thread ${params.threadId}`;
     const commitResult = runGit(
       [
@@ -272,48 +271,25 @@ export function mergeChatWorktree(params: {
     return { merged: true, message: "No changes to merge." };
   }
 
-  const mainStatus = runGit(["status", "--porcelain"], {
-    cwd: params.repoPath,
-    allowFailure: true,
-  });
-  if (mainStatus.stdout.trim()) {
-    throw new Error("Main branch has uncommitted changes. Clean it before merging.");
-  }
-
-  const currentBranch = runGit(["rev-parse", "--abbrev-ref", "HEAD"], {
-    cwd: params.repoPath,
-    allowFailure: true,
-  }).stdout.trim();
-  if (!currentBranch) {
-    throw new Error("Unable to determine current branch.");
-  }
-
-  if (currentBranch !== baseBranch) {
-    runGit(["checkout", baseBranch], { cwd: params.repoPath });
-  }
-
-  const mergeResult = runGit(["merge", "--no-ff", params.branchName], {
-    cwd: params.repoPath,
-    allowFailure: true,
+  // Merge via mergeNoTouch so the user's checkout is never switched
+  const mergeResult = mergeNoTouch({
+    repoPath: params.repoPath,
+    baseBranch,
+    branchName: params.branchName,
+    mergeMessage: `Merge chat/${params.threadId} into ${baseBranch}`,
+    gitName: "Shiftboss Chat",
+    gitEmail: "chat@local",
   });
 
-  if (mergeResult.status !== 0) {
-    runGit(["merge", "--abort"], { cwd: params.repoPath, allowFailure: true });
-    if (currentBranch && currentBranch !== baseBranch) {
-      runGit(["checkout", currentBranch], { cwd: params.repoPath, allowFailure: true });
-    }
-    const conflicts = listUnmergedFiles(params.repoPath);
+  if (!mergeResult.ok) {
+    const conflicts = mergeResult.conflictFiles;
     const detail = conflicts.length
       ? `Merge conflict in: ${conflicts.join(", ")}`
-      : mergeResult.stderr.trim() || mergeResult.stdout.trim() || "merge failed";
+      : mergeResult.error || "merge failed";
     const suffix = conflicts.length
-      ? "Resolve conflicts manually in the repo and retry."
+      ? " Resolve conflicts manually in the repo and retry."
       : "";
-    throw new Error(`Merge failed. ${detail}${suffix ? ` ${suffix}` : ""}`);
-  }
-
-  if (currentBranch && currentBranch !== baseBranch) {
-    runGit(["checkout", currentBranch], { cwd: params.repoPath, allowFailure: true });
+    throw new Error(`Merge failed. ${detail}${suffix}`);
   }
 
   cleanupChatWorktree({
@@ -324,3 +300,8 @@ export function mergeChatWorktree(params: {
 
   return { merged: true };
 }
+
+export const __test__ = {
+  stageSafeChanges,
+  mergeNoTouch,
+};
