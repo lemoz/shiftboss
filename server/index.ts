@@ -356,7 +356,7 @@ import {
 import { getProjectCostHistory, getProjectCostSummary } from "./cost_tracking.js";
 import { applyChatAction, undoChatAction } from "./chat_actions.js";
 import { listChatAttention, listChatAttentionSummaries } from "./chat_attention.js";
-import { getHealthResponse } from "./health.js";
+import { getHealthResponse, isValidHealthToken } from "./health.js";
 import { buildWorktreeDiff, cleanupChatWorktree, resolveChatWorktreeConfig } from "./chat_worktree.js";
 import {
   createChatThread,
@@ -694,10 +694,9 @@ function normalizeHealthPath(value: string): string {
 }
 
 function hasValidHealthToken(req: Request): boolean {
-  if (!healthToken) return true;
-  const queryToken = typeof req.query?.token === "string" ? req.query.token.trim() : "";
-  const headerToken = req.get("x-health-token")?.trim() ?? "";
-  return queryToken === healthToken || headerToken === healthToken;
+  const queryToken = typeof req.query?.token === "string" ? req.query.token : "";
+  const headerToken = req.get("x-health-token") ?? "";
+  return isValidHealthToken(healthToken, queryToken, headerToken);
 }
 
 function cleanupThreadWorktree(thread: {
