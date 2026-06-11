@@ -460,7 +460,14 @@ export function KanbanBoard({ repoId }: { repoId: string }) {
               : msg
           );
         }
-        const updated = json as WorkOrder;
+        const updated = json as WorkOrder & { cascaded_to_ready?: string[] };
+        const cascaded = updated.cascaded_to_ready;
+        if (cascaded?.length) {
+          // Dependents were auto-promoted to ready on disk — reload the full board
+          // so they appear in the correct column without a manual Refresh.
+          await load();
+          return;
+        }
         setWorkOrders((prev) =>
           prev.map((w) => (w.id === updated.id ? updated : w))
         );
@@ -474,7 +481,7 @@ export function KanbanBoard({ repoId }: { repoId: string }) {
         });
       }
     },
-    [repoId]
+    [repoId, load]
   );
 
   const create = useCallback(async (titleOverride?: string) => {
