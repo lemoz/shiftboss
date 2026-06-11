@@ -2635,6 +2635,17 @@ function initSchema(database: Database.Database) {
   database.exec(
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_slack_conversation_messages_key ON slack_conversation_messages(conversation_id, message_key) WHERE message_key IS NOT NULL;"
   );
+
+  // Sequence-claim table for collision-free WO id allocation across worktrees.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS wo_id_claims (
+      project_id TEXT NOT NULL,
+      year INTEGER NOT NULL,
+      seq INTEGER NOT NULL,
+      claimed_at TEXT NOT NULL,
+      PRIMARY KEY (project_id, year, seq)
+    );
+  `);
 }
 
 export function listProjects(): ProjectRow[] {
@@ -2782,12 +2793,17 @@ export function mergeProjectsByPath(
         .run(keepId);
     }
 
-    const moveProjectIdStmts = listProjectIdForeignKeys(database).map((fk) => ({
-      ...fk,
-      stmt: database.prepare(
-        `UPDATE ${quoteIdentifier(fk.table)} SET ${quoteIdentifier(fk.column)} = ? WHERE ${quoteIdentifier(fk.column)} = ?`
-      ),
-    }));
+    // Build movers for FK-declared tables that reference projects(id), excluding
+    // composite-PK tables we handle explicitly below (work_orders, wo_tracks).
+    const skipTables = new Set(["work_orders", "wo_tracks"]);
+    const moveProjectIdStmts = listProjectIdForeignKeys(database)
+      .filter((fk) => !skipTables.has(fk.table))
+      .map((fk) => ({
+        ...fk,
+        stmt: database.prepare(
+          `UPDATE ${quoteIdentifier(fk.table)} SET ${quoteIdentifier(fk.column)} = ? WHERE ${quoteIdentifier(fk.column)} = ?`
+        ),
+      }));
     const deleteProjectStmt = database.prepare(
       "DELETE FROM projects WHERE id = ? AND id != ?"
     );
@@ -2797,10 +2813,101 @@ export function mergeProjectsByPath(
       if (!dupId || dupId === keepId) continue;
       mergedIds.push(dupId);
 
+      // ── wo_tracks (composite PK + FK to work_orders — no ON UPDATE CASCADE) ─
+      // Must be moved BEFORE we touch work_orders, because updating work_orders
+      // (project_id=dup → keep) would leave wo_tracks with dangling FK parents.
+      // Strategy: collect the wo_ids under dup that will survive (i.e. not already
+      // present under keep), delete all dup wo_tracks, move work_orders, then
+      // re-insert wo_tracks under the new parent.
+      const dupWoTracksToKeep = database
+        .prepare(
+          `SELECT wo_id, track_id, created_at
+           FROM wo_tracks
+           WHERE project_id = @dup
+             AND wo_id NOT IN (SELECT id FROM work_orders WHERE project_id = @keep)`
+        )
+        .all({ dup: dupId, keep: keepId }) as Array<{
+          wo_id: string;
+          track_id: string;
+          created_at: string;
+        }>;
+      // Delete all wo_tracks for dup (parent FK still intact at this point).
+      database
+        .prepare("DELETE FROM wo_tracks WHERE project_id = ?")
+        .run(dupId);
+
+      // ── work_orders (composite PK: project_id, id) ───────────────────────
+      // Delete dup rows whose id already exists under keepId to avoid PK collision.
+      database
+        .prepare(
+          `DELETE FROM work_orders
+           WHERE project_id = @dup
+             AND id IN (SELECT id FROM work_orders WHERE project_id = @keep)`
+        )
+        .run({ dup: dupId, keep: keepId });
+      // Now move the remaining dup rows (no PK conflict possible).
+      const woMoved = database
+        .prepare("UPDATE work_orders SET project_id = ? WHERE project_id = ?")
+        .run(keepId, dupId).changes;
+      movedWorkOrders += woMoved;
+
+      // Re-insert the saved wo_tracks rows under the new parent (keepId).
+      if (dupWoTracksToKeep.length > 0) {
+        const insertWoTrack = database.prepare(
+          `INSERT OR IGNORE INTO wo_tracks (project_id, wo_id, track_id, created_at)
+           VALUES (?, ?, ?, ?)`
+        );
+        for (const row of dupWoTracksToKeep) {
+          insertWoTrack.run(keepId, row.wo_id, row.track_id, row.created_at);
+        }
+      }
+
+      // ── work_order_deps (no FK to projects — project_id is part of PK) ────
+      database
+        .prepare(
+          `INSERT OR IGNORE INTO work_order_deps (project_id, work_order_id, depends_on_id, created_at)
+           SELECT @keep, work_order_id, depends_on_id, created_at
+           FROM work_order_deps
+           WHERE project_id = @dup`
+        )
+        .run({ keep: keepId, dup: dupId });
+      database
+        .prepare("DELETE FROM work_order_deps WHERE project_id = ?")
+        .run(dupId);
+
+      // ── people_projects (no FK to projects — project_id has a unique index) ─
+      // Drop dup rows whose person already has a link to keepId (avoids unique
+      // (person_id, project_id) conflict), then UPDATE the rest.
+      database
+        .prepare(
+          `DELETE FROM people_projects
+           WHERE project_id = @dup
+             AND person_id IN (
+               SELECT person_id FROM people_projects WHERE project_id = @keep
+             )`
+        )
+        .run({ dup: dupId, keep: keepId });
+      database
+        .prepare("UPDATE people_projects SET project_id = ? WHERE project_id = ?")
+        .run(keepId, dupId);
+
+      // ── security_incidents (no FK to projects) ────────────────────────────
+      database
+        .prepare("UPDATE security_incidents SET project_id = ? WHERE project_id = ?")
+        .run(keepId, dupId);
+
+      // ── escalations.from_project_id / to_project_id (bare TEXT, no FK) ───
+      database
+        .prepare("UPDATE escalations SET from_project_id = ? WHERE from_project_id = ?")
+        .run(keepId, dupId);
+      database
+        .prepare("UPDATE escalations SET to_project_id = ? WHERE to_project_id = ?")
+        .run(keepId, dupId);
+
+      // ── Generic FK-declared tables ────────────────────────────────────────
       for (const mover of moveProjectIdStmts) {
         const moved = mover.stmt.run(keepId, dupId).changes;
         if (mover.table === "runs" && mover.column === "project_id") movedRuns += moved;
-        if (mover.table === "work_orders" && mover.column === "project_id") movedWorkOrders += moved;
       }
       deletedProjects += deleteProjectStmt.run(dupId, keepId).changes;
     }
@@ -6755,6 +6862,78 @@ export function listAllWorkOrderDeps(projectId: string): WorkOrderDepRow[] {
   return database
     .prepare("SELECT * FROM work_order_deps WHERE project_id = ?")
     .all(projectId) as WorkOrderDepRow[];
+}
+
+/**
+ * Atomically claim the next available WO sequence number for a project+year.
+ * Uses an INSERT-or-skip loop inside a transaction so concurrent processes
+ * (e.g. multiple worktrees running at the same time) always get distinct seqs.
+ *
+ * @param projectId  - The project's DB id (may be null if the project is not yet registered)
+ * @param year       - The 4-digit year
+ * @param dirFloor   - Minimum sequence already seen by scanning the work_orders/ directory
+ * @returns          - The claimed sequence number (≥ dirFloor + 1)
+ */
+export function claimWorkOrderSequence(
+  projectId: string | null,
+  year: number,
+  dirFloor: number
+): number {
+  if (!projectId) return dirFloor + 1;
+  const database = getDb();
+  const now = new Date().toISOString();
+
+  // Find the highest already-claimed seq for this project+year.
+  const row = database
+    .prepare(
+      "SELECT MAX(seq) AS max_seq FROM wo_id_claims WHERE project_id = ? AND year = ?"
+    )
+    .get(projectId, year) as { max_seq: number | null };
+  let candidate = Math.max(dirFloor, row.max_seq ?? 0) + 1;
+
+  // INSERT with ON CONFLICT IGNORE so concurrent callers skip colliding slots.
+  const insert = database.prepare(
+    "INSERT OR IGNORE INTO wo_id_claims (project_id, year, seq, claimed_at) VALUES (?, ?, ?, ?)"
+  );
+  while (true) {
+    const result = insert.run(projectId, year, candidate, now);
+    if (result.changes > 0) return candidate;
+    candidate += 1;
+  }
+}
+
+/**
+ * Delete a claimed WO sequence number (e.g. when the file creation fails).
+ */
+export function releaseWorkOrderSequence(
+  projectId: string | null,
+  year: number,
+  seq: number
+): void {
+  if (!projectId) return;
+  const database = getDb();
+  database
+    .prepare("DELETE FROM wo_id_claims WHERE project_id = ? AND year = ? AND seq = ?")
+    .run(projectId, year, seq);
+}
+
+/**
+ * Delete a work_order row (and its child wo_tracks / work_order_deps rows) from the DB.
+ */
+export function deleteWorkOrderRow(projectId: string, workOrderId: string): void {
+  const database = getDb();
+  const tx = database.transaction(() => {
+    database
+      .prepare("DELETE FROM work_order_deps WHERE project_id = ? AND work_order_id = ?")
+      .run(projectId, workOrderId);
+    database
+      .prepare("DELETE FROM wo_tracks WHERE project_id = ? AND wo_id = ?")
+      .run(projectId, workOrderId);
+    database
+      .prepare("DELETE FROM work_orders WHERE project_id = ? AND id = ?")
+      .run(projectId, workOrderId);
+  });
+  tx();
 }
 
 export function listWorkOrdersByTag(projectId: string, tag: string): TaggedWorkOrder[] {
