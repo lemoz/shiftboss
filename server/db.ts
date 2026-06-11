@@ -7541,6 +7541,42 @@ export function updateGlobalShift(
   return result.changes > 0;
 }
 
+/**
+ * Like updateGlobalShift but only applies the patch when the shift is still
+ * 'active'.  Returns false both when the row doesn't exist AND when the row
+ * exists but has already been expired/failed by another path — callers can
+ * distinguish the two by calling getGlobalShiftById first if needed.
+ *
+ * Use this to close the race where a timed-out decideWithClaude call returns
+ * after the shift was force-expired by the session loop, so the zombie loop
+ * cannot overwrite 'expired' with 'completed'.
+ */
+export function updateGlobalShiftIfActive(
+  id: string,
+  patch: Partial<
+    Pick<GlobalShiftRow, "status" | "completed_at" | "expires_at" | "handoff_id" | "error">
+  >
+): boolean {
+  const database = getDb();
+  const fields: Array<{ key: keyof typeof patch; column: string }> = [
+    { key: "status", column: "status" },
+    { key: "completed_at", column: "completed_at" },
+    { key: "expires_at", column: "expires_at" },
+    { key: "handoff_id", column: "handoff_id" },
+    { key: "error", column: "error" },
+  ];
+  const sets = fields
+    .filter((field) => patch[field.key] !== undefined)
+    .map((field) => `${field.column} = @${field.key}`);
+  if (!sets.length) return false;
+  const result = database
+    .prepare(
+      `UPDATE global_shifts SET ${sets.join(", ")} WHERE id = @id AND status = 'active'`
+    )
+    .run({ id, ...patch });
+  return result.changes > 0;
+}
+
 function parseProjectState(value: string | null): GlobalShiftStateSnapshot | null {
   if (!value) return null;
   try {
