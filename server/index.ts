@@ -86,6 +86,9 @@ import {
   listPeople,
   listConversationEvents,
   listSubscribers,
+  clearWorkOrderNeedsHuman,
+  getWorkOrderNeedsHuman,
+  listWorkOrderNeedsHumanFlags,
   markSecurityIncidentFalsePositive,
   markInProgressRunsFailed,
   markWorkOrderRunsMerged,
@@ -305,6 +308,7 @@ import {
 import {
   getAutopilotCandidates,
   getAutopilotSnapshot,
+  markRejectedWorkOrderPaused,
   parseAutopilotPolicyPatch,
   startAutopilotScheduler,
   updateAutopilotPolicyFromPatch,
@@ -5218,11 +5222,13 @@ app.get("/repos/:id/work-orders", (req, res) => {
 
   const workOrders = listWorkOrders(project.path);
   const dependencyLookups = buildDependencyLookups(project, workOrders);
+  const needsHumanMap = listWorkOrderNeedsHumanFlags(project.id);
   const workOrdersWithDeps = workOrders.map((wo) => {
     const resolved = resolveWorkOrderDependencies(wo, project.id, dependencyLookups);
     const summary = summarizeResolvedDependencies(resolved);
     return {
       ...wo,
+      needs_human: needsHumanMap.get(wo.id) ?? false,
       resolved_dependencies: resolved,
       blocked_by_cross_project: summary.blockedByCrossProject,
       deps_satisfied: summary.depsSatisfied,
@@ -5249,10 +5255,12 @@ app.get("/repos/:id/work-orders/:workOrderId", (req, res) => {
     const resolved = resolveWorkOrderDependencies(workOrder, project.id, dependencyLookups);
     const summary = summarizeResolvedDependencies(resolved);
     const markdown = readWorkOrderMarkdown(project.path, workOrderId);
+    const needsHuman = getWorkOrderNeedsHuman(project.id, workOrderId);
     return res.json({
       project: { id: project.id, name: project.name, path: project.path },
       work_order: {
         ...workOrder,
+        needs_human: needsHuman,
         resolved_dependencies: resolved,
         blocked_by_cross_project: summary.blockedByCrossProject,
         deps_satisfied: summary.depsSatisfied,
@@ -5285,6 +5293,21 @@ app.patch("/repos/:id/work-orders/:workOrderId", (req, res) => {
   try {
     const before = getWorkOrder(project.path, workOrderId);
     const updated = patchWorkOrder(project.path, workOrderId, req.body ?? {});
+    // Clear the autopilot-pause flag only when the patch contains a meaningful
+    // content edit (title, goal, context, acceptance criteria, non-goals,
+    // stop conditions, or status).  Metadata-only patches (priority, tags,
+    // base_branch, estimate_hours, reviewer_snapshot) do NOT clear the flag —
+    // an automated system adjusting priority should not silently re-enable
+    // autopilot for a WO that a human explicitly rejected.
+    const body = req.body ?? {};
+    const CONTENT_FIELDS = [
+      "title", "goal", "context", "acceptance_criteria",
+      "non_goals", "stop_conditions", "status",
+    ] as const;
+    const isContentEdit = CONTENT_FIELDS.some((f) => f in body);
+    if (isContentEdit) {
+      clearWorkOrderNeedsHuman(project.id, workOrderId);
+    }
     if (before.status !== "done" && updated.status === "done") {
       markWorkOrderRunsMerged(project.id, workOrderId);
     }
@@ -6156,6 +6179,12 @@ app.post("/runs/:runId/reject", (req, res) => {
           ? 400
           : 500;
     return res.status(status).json({ error: result.error, code: result.code });
+  }
+  // If this was an autopilot run, pause the WO so autopilot doesn't
+  // immediately re-enqueue the same work order.  A human must edit the WO
+  // (which clears needs_human) before autopilot will pick it up again.
+  if (result.run.triggered_by === "autopilot") {
+    markRejectedWorkOrderPaused(result.run.project_id, result.run.work_order_id);
   }
   return res.json(result.run);
 });

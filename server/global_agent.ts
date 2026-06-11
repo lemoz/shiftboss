@@ -140,6 +140,8 @@ export type GlobalAgentRunResult =
       shift: GlobalShiftRow;
       handoff: GlobalShiftHandoff;
       actions: GlobalAgentActionResult[];
+      /** Set when the last action was WAIT and the agent specified a retry delay. */
+      wait_minutes?: number;
     }
   | {
       ok: false;
@@ -977,6 +979,8 @@ export async function runGlobalAgentShift(
   );
   let error: Error | null = null;
   let handoff: GlobalShiftHandoff | null = null;
+  // Populated when the final decision is WAIT and specifies a retry delay.
+  let shiftWaitMinutes: number | undefined;
 
   try {
     for (let i = 0; i < maxIterations; i += 1) {
@@ -1025,7 +1029,10 @@ export async function runGlobalAgentShift(
       });
       const actionResult = await executeDecision(decision, options);
       actions.push(actionResult);
-      if (decision.action === "WAIT") break;
+      if (decision.action === "WAIT") {
+        shiftWaitMinutes = decision.retry_after_minutes;
+        break;
+      }
     }
   } catch (err) {
     error = err instanceof Error ? err : new Error("global agent shift failed");
@@ -1097,5 +1104,5 @@ export async function runGlobalAgentShift(
       activeShift: updatedShift,
     };
   }
-  return { ok: true, shift: updatedShift, handoff, actions };
+  return { ok: true, shift: updatedShift, handoff, actions, wait_minutes: shiftWaitMinutes };
 }

@@ -38,6 +38,8 @@ type WorkOrder = {
   created_at: string;
   updated_at: string;
   ready_check: { ok: boolean; errors: string[] };
+  /** True when autopilot is paused for this WO pending human review. */
+  needs_human: boolean;
   trackId: string | null;
   track: { id: string; name: string; color: string | null } | null;
   trackIds: string[];
@@ -874,6 +876,15 @@ function WorkOrderCard({
 
       <div style={{ marginTop: 10, display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center" }}>
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          {workOrder.needs_human && (
+            <span
+              className="badge"
+              title="Autopilot paused — a previous run was rejected. Edit this WO to re-enable autopilot."
+              style={{ color: "var(--color-warning, #b45309)" }}
+            >
+              needs review
+            </span>
+          )}
           {latestRun && (
             <>
               <span className="badge" title={runStatusTitle}>
