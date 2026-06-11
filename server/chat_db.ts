@@ -83,6 +83,8 @@ export type ChatRunRow = {
   started_at: string | null;
   finished_at: string | null;
   error: string | null;
+  /** PID of the detached chat worker process; null until the worker is spawned. */
+  worker_pid: number | null;
 };
 
 export type ChatRunCommandRow = {
@@ -601,13 +603,14 @@ export function createChatRun(params: {
     started_at: null,
     finished_at: null,
     error: null,
+    worker_pid: null,
   };
 
   db.prepare(
     `INSERT INTO chat_runs
-      (id, thread_id, user_message_id, assistant_message_id, status, model, cli_path, cwd, context_depth, access_filesystem, access_cli, access_network, access_network_allowlist, suggestion_json, suggestion_accepted, log_path, created_at, started_at, finished_at, error)
+      (id, thread_id, user_message_id, assistant_message_id, status, model, cli_path, cwd, context_depth, access_filesystem, access_cli, access_network, access_network_allowlist, suggestion_json, suggestion_accepted, log_path, created_at, started_at, finished_at, error, worker_pid)
      VALUES
-      (@id, @thread_id, @user_message_id, @assistant_message_id, @status, @model, @cli_path, @cwd, @context_depth, @access_filesystem, @access_cli, @access_network, @access_network_allowlist, @suggestion_json, @suggestion_accepted, @log_path, @created_at, @started_at, @finished_at, @error)`
+      (@id, @thread_id, @user_message_id, @assistant_message_id, @status, @model, @cli_path, @cwd, @context_depth, @access_filesystem, @access_cli, @access_network, @access_network_allowlist, @suggestion_json, @suggestion_accepted, @log_path, @created_at, @started_at, @finished_at, @error, @worker_pid)`
   ).run(run);
 
   emitChatRunStatusEvent(run);
@@ -643,6 +646,7 @@ export function updateChatRun(
       | "finished_at"
       | "error"
       | "cwd"
+      | "worker_pid"
     >
   >
 ): boolean {
@@ -654,6 +658,7 @@ export function updateChatRun(
     { key: "finished_at", column: "finished_at" },
     { key: "error", column: "error" },
     { key: "cwd", column: "cwd" },
+    { key: "worker_pid", column: "worker_pid" },
   ];
   const sets = fields
     .filter((f) => patch[f.key] !== undefined)

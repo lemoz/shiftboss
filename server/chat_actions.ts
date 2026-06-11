@@ -1,9 +1,13 @@
 import fs from "fs";
 import { z } from "zod";
 import {
+  acquireMergeLock,
   findProjectById,
   getDb,
+  MERGE_LOCK_HEARTBEAT_INTERVAL_MS,
   markWorkOrderRunsMerged,
+  refreshMergeLockHeartbeat,
+  releaseMergeLock,
   setProjectHidden,
   setProjectStar,
   updateProjectSuccess,
@@ -13,6 +17,7 @@ import {
   getChatActionLedgerEntry,
   getChatMessageById,
   getChatThreadById,
+  listChatRunsForThread,
   markChatActionUndone,
   updateChatThread,
 } from "./chat_db.js";
@@ -342,12 +347,59 @@ export function applyChatAction(input: unknown) {
         if (!fs.existsSync(worktreePath)) {
           throw new Error("worktree not found on disk");
         }
-        const merged = mergeChatWorktree({
-          repoPath: project.path,
-          threadId: thread.id,
-          worktreePath,
-          branchName,
-        });
+
+        // Guard: refuse to merge while a chat run is in flight for this thread —
+        // merging removes the worktree which would yank it out from under a live worker.
+        const inFlightRun = listChatRunsForThread(thread.id, 50).find(
+          (r) => r.status === "running" || r.status === "queued"
+        );
+        if (inFlightRun) {
+          throw new Error(
+            `Cannot merge while a chat run (${inFlightRun.id.slice(0, 8)}) is ${inFlightRun.status} for this thread. ` +
+            `Wait for it to finish before merging.`
+          );
+        }
+
+        // Acquire the per-project merge lock to prevent concurrent runner or chat
+        // merges on the same working tree.
+        const mergeLockId = `chat-${thread.id}`;
+        const LOCK_TIMEOUT_MS = 2 * 60 * 1000; // 2-minute timeout for synchronous chat path
+        const LOCK_POLL_MS = 500;
+        const lockStart = Date.now();
+        let lockAcquired = false;
+        while (!lockAcquired) {
+          lockAcquired = acquireMergeLock(projectId, mergeLockId);
+          if (lockAcquired) break;
+          if (Date.now() - lockStart >= LOCK_TIMEOUT_MS) {
+            throw new Error(
+              `Could not acquire merge lock for project ${projectId.slice(0, 8)} after 2 minutes. ` +
+              `Another merge may be in progress — try again shortly.`
+            );
+          }
+          // Synchronous poll — chat actions run in a request handler so we can't
+          // use async/await here; a tight loop with short sleep is acceptable.
+          const until = Date.now() + LOCK_POLL_MS;
+          while (Date.now() < until) { /* spin */ }
+        }
+
+        // Refresh heartbeat on an interval so the lock is not reaped while we work.
+        const heartbeatInterval = setInterval(() => {
+          try { refreshMergeLockHeartbeat(projectId, mergeLockId); } catch { /* ignore */ }
+        }, MERGE_LOCK_HEARTBEAT_INTERVAL_MS);
+
+        let merged: ReturnType<typeof mergeChatWorktree>;
+        try {
+          merged = mergeChatWorktree({
+            repoPath: project.path,
+            threadId: thread.id,
+            worktreePath,
+            branchName,
+          });
+        } finally {
+          clearInterval(heartbeatInterval);
+          releaseMergeLock(projectId, mergeLockId);
+        }
+
         updateChatThread({
           threadId: thread.id,
           worktreePath: null,
