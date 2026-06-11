@@ -296,7 +296,7 @@ import {
   tailRunLog,
 } from "./observability.js";
 import { readControlMetadata } from "./sidecar.js";
-import { spawnShiftAgent, tailShiftLog } from "./shift_agent.js";
+import { resolveShiftLogPaths, spawnShiftAgent, tailShiftLog } from "./shift_agent.js";
 import {
   getShiftSchedulerStatus,
   notifyShiftSchedulerSettingsUpdated,
@@ -336,6 +336,7 @@ import {
   updateGlobalAgentSessionDetails,
 } from "./global_agent_sessions.js";
 import {
+  BudgetPoolOversubscribedError,
   getGlobalBudget,
   getProjectBudget,
   setGlobalMonthlyBudget,
@@ -353,7 +354,7 @@ import {
   suggestChatSettingsForThread,
   PendingSendError,
 } from "./chat_agent.js";
-import { getProjectCostHistory, getProjectCostSummary } from "./cost_tracking.js";
+import { getProjectCostHistory, getProjectCostSummary, parseShiftCostFromStreamJsonLog, recordCostEntry } from "./cost_tracking.js";
 import { applyChatAction, undoChatAction } from "./chat_actions.js";
 import { listChatAttention, listChatAttentionSummaries } from "./chat_attention.js";
 import { getHealthResponse } from "./health.js";
@@ -2145,7 +2146,19 @@ app.put("/projects/:id/budget", (req, res) => {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
     return res.status(400).json({ error: "`monthly_allocation_usd` must be a non-negative number" });
   }
-  return res.json(setProjectBudget(project.id, value));
+  try {
+    return res.json(setProjectBudget(project.id, value));
+  } catch (err) {
+    if (err instanceof BudgetPoolOversubscribedError) {
+      return res.status(409).json({
+        error: "allocation would exceed the global budget pool",
+        available_usd: err.availableUsd,
+        requested_usd: err.requestedUsd,
+        global_monthly_usd: err.globalMonthlyUsd,
+      });
+    }
+    throw err;
+  }
 });
 
 app.post("/projects/:id/budget/transfer", (req, res) => {
@@ -4832,6 +4845,26 @@ app.post("/projects/:id/shifts/:shiftId/complete", (req, res) => {
         handoff_id: handoff.id,
         error: null,
       } as const);
+
+    // Record shift agent cost against the project so budget consumption
+    // queries include autonomous shift spend.  Skip when the log is absent or
+    // empty (model=null, usage=null, totalCostUsd=null) to avoid spurious
+    // conservative-pricing warnings on zero-cost records.
+    const { absolutePath: shiftLogPath } = resolveShiftLogPaths(project.path, shiftId);
+    const shiftCost = parseShiftCostFromStreamJsonLog(shiftLogPath);
+    if (shiftCost.model !== null || shiftCost.usage !== null || shiftCost.totalCostUsd !== null) {
+      recordCostEntry({
+        projectId: project.id,
+        runId: null,
+        category: "other",
+        model: shiftCost.model ?? "unknown",
+        usage: shiftCost.usage,
+        totalCostUsdOverride: shiftCost.totalCostUsd ?? undefined,
+        description: `shift ${shiftId}`,
+        createdAt: completedAt,
+      });
+    }
+
     return res.json({ shift: updatedShift, handoff });
   } catch (err) {
     return res.status(500).json({

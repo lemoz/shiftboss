@@ -12,7 +12,7 @@ type GlobalBudget = {
   remaining_usd: number;
 };
 
-type BudgetStatus = "healthy" | "warning" | "critical" | "exhausted";
+type BudgetStatus = "healthy" | "warning" | "critical" | "exhausted" | "unbudgeted";
 
 type ProjectBudget = {
   project_id: string;
@@ -355,7 +355,7 @@ export function BudgetPanel({ repoId }: { repoId: string }) {
 
   const budgetAlert = useMemo(() => {
     if (!projectBudget || dismissedAlert) return null;
-    if (projectBudget.budget_status === "healthy") return null;
+    if (projectBudget.budget_status === "healthy" || projectBudget.budget_status === "unbudgeted") return null;
     const label =
       projectBudget.budget_status === "warning"
         ? "Budget warning"

@@ -337,7 +337,8 @@ test("buildGlobalContextResponse aggregates and sorts projects", () => {
     response.economy.projects_healthy +
     response.economy.projects_warning +
     response.economy.projects_critical +
-    response.economy.projects_exhausted;
+    response.economy.projects_exhausted +
+    (response.economy.projects_unbudgeted ?? 0);
   assert.equal(statusTotal, response.projects.length);
   assert.ok(Number.isFinite(Date.parse(response.assembled_at)));
 });

@@ -15,7 +15,7 @@ import {
   type Track,
 } from "./db.js";
 import {
-  extractTokenUsageFromClaudeResponse,
+  extractClaudeResponseCost,
   parseCodexTokenUsageFromLog,
   recordCostEntry,
 } from "./cost_tracking.js";
@@ -546,7 +546,7 @@ async function generateHandoff(params: {
   projectPath: string;
   model: string;
   cliPath?: string;
-}): Promise<{ text: string; usage: { inputTokens: number; outputTokens: number } | null }> {
+}): Promise<{ text: string; usage: { inputTokens: number; outputTokens: number } | null; totalCostUsd: number | null }> {
   const result = await execFileAsync(
     claudeCommand(params.cliPath),
     ["-p", params.prompt, "--model", params.model, "--output-format", "json"],
@@ -561,9 +561,9 @@ async function generateHandoff(params: {
     throw new Error("Claude CLI returned empty output");
   }
   const parsed = JSON.parse(stdout) as unknown;
-  const usage = extractTokenUsageFromClaudeResponse(parsed);
+  const { usage, totalCostUsd } = extractClaudeResponseCost(parsed);
   const text = extractClaudeText(parsed) ?? stdout;
-  return { text, usage };
+  return { text, usage, totalCostUsd };
 }
 
 async function runCodexPrompt(params: {
@@ -674,6 +674,7 @@ export async function generateAndStoreHandoff(params: {
     const fallback = fallbackHandoff(artifacts);
     let handoffContent = fallback;
     let handoffUsage: { inputTokens: number; outputTokens: number } | null = null;
+    let handoffTotalCostUsd: number | null = null;
     let model = CLAUDE_HANDOFF_MODEL;
 
     try {
@@ -698,6 +699,7 @@ export async function generateAndStoreHandoff(params: {
           cliPath: settings.cliPath,
         });
         handoffUsage = result.usage;
+        handoffTotalCostUsd = result.totalCostUsd;
         text = result.text;
       }
       const parsed = parseHandoffOutput(text);
@@ -713,6 +715,7 @@ export async function generateAndStoreHandoff(params: {
       category: "handoff",
       model,
       usage: handoffUsage,
+      totalCostUsdOverride: handoffTotalCostUsd ?? undefined,
       description: "handoff generation",
     });
 

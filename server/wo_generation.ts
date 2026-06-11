@@ -16,7 +16,7 @@ import {
 import { buildWorkOrderGenerationPrompt } from "./prompts/wo_generation.js";
 import { listWorkOrders, readyCheck, type WorkOrder } from "./work_orders.js";
 import {
-  extractTokenUsageFromClaudeResponse,
+  extractClaudeResponseCost,
   parseCodexTokenUsageFromLog,
   recordCostEntry,
 } from "./cost_tracking.js";
@@ -209,7 +209,7 @@ async function runClaudePrompt(params: {
   projectPath: string;
   model: string;
   cliPath?: string;
-}): Promise<{ text: string; usage: { inputTokens: number; outputTokens: number } | null }> {
+}): Promise<{ text: string; usage: { inputTokens: number; outputTokens: number } | null; totalCostUsd: number | null }> {
   const command = claudeCommand(params.cliPath);
   const result = await execFileAsync(
     command,
@@ -226,11 +226,11 @@ async function runClaudePrompt(params: {
   try {
     parsed = JSON.parse(stdout) as unknown;
   } catch {
-    return { text: stdout, usage: null };
+    return { text: stdout, usage: null, totalCostUsd: null };
   }
-  const usage = extractTokenUsageFromClaudeResponse(parsed);
+  const { usage, totalCostUsd } = extractClaudeResponseCost(parsed);
   const text = extractClaudeText(parsed) ?? stdout;
-  return { text, usage };
+  return { text, usage, totalCostUsd };
 }
 
 async function runCodexPrompt(params: {
@@ -586,6 +586,7 @@ export async function generateWorkOrderDraft(params: {
   let llmUsed = false;
   let llmError: string | null = null;
   let usage: { inputTokens: number; outputTokens: number } | null = null;
+  let totalCostUsd: number | null = null;
   let model = CLAUDE_WO_MODEL;
   const settings = resolveUtilitySettings().effective;
 
@@ -609,6 +610,7 @@ export async function generateWorkOrderDraft(params: {
         cliPath: settings.cliPath,
       });
       usage = result.usage;
+      totalCostUsd = result.totalCostUsd;
       llmDraft = parseLlmOutput(result.text);
     }
     llmUsed = llmDraft !== null;
@@ -624,6 +626,7 @@ export async function generateWorkOrderDraft(params: {
     category: "other",
     model,
     usage,
+    totalCostUsdOverride: totalCostUsd ?? undefined,
     description: "work order generation",
   });
 

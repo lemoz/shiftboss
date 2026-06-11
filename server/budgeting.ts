@@ -1,6 +1,6 @@
 import { getDb } from "./db.js";
 
-export type BudgetStatus = "healthy" | "warning" | "critical" | "exhausted";
+export type BudgetStatus = "healthy" | "warning" | "critical" | "exhausted" | "unbudgeted";
 
 export type GlobalBudget = {
   monthly_budget_usd: number;
@@ -209,8 +209,10 @@ function sumProjectSpend(projectId: string, periodStart: string, periodEnd: stri
 }
 
 function getBudgetStatus(remaining: number, allocation: number): BudgetStatus {
+  // No budget configured — treat as unlimited (unbudgeted). This covers fresh
+  // installs where no project_budgets row exists (allocation === 0, spent === 0).
   if (!Number.isFinite(allocation) || allocation <= 0) {
-    return remaining <= 0 ? "exhausted" : "healthy";
+    return "unbudgeted";
   }
   const pct = remaining / allocation;
   if (pct <= 0) return "exhausted";
@@ -279,8 +281,39 @@ export function getProjectBudget(projectId: string): ProjectBudget {
   };
 }
 
+export class BudgetPoolOversubscribedError extends Error {
+  constructor(
+    public readonly requestedUsd: number,
+    public readonly availableUsd: number,
+    public readonly globalMonthlyUsd: number
+  ) {
+    super(
+      `Allocation of ${requestedUsd.toFixed(2)} exceeds available pool (${availableUsd.toFixed(2)} of ${globalMonthlyUsd.toFixed(2)} remaining). Reduce other allocations first.`
+    );
+    this.name = "BudgetPoolOversubscribedError";
+  }
+}
+
 export function setProjectBudget(projectId: string, monthlyAllocationUsd: number): ProjectBudget {
   const now = new Date();
+  const settings = ensureBudgetSettings(now);
+  const globalMonthly = settings.monthly_budget_usd ?? 0;
+
+  // When a global budget pool is configured, guard against oversubscription.
+  // The current allocation for this project is excluded from the used sum so
+  // that updating an existing allocation (e.g. $50→$60) computes headroom
+  // correctly against the remaining unallocated pool.
+  if (globalMonthly > 0) {
+    const currentRow = getProjectBudgetRow(projectId);
+    const currentAllocation = currentRow?.monthly_allocation_usd ?? 0;
+    const totalAllocated = sumProjectAllocations();
+    const unallocated = globalMonthly - totalAllocated + currentAllocation;
+    const requested = normalizeAmount(monthlyAllocationUsd);
+    if (requested > unallocated) {
+      throw new BudgetPoolOversubscribedError(requested, unallocated, globalMonthly);
+    }
+  }
+
   upsertProjectBudgetRow(projectId, monthlyAllocationUsd, now);
   return getProjectBudget(projectId);
 }

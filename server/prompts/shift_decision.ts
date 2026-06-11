@@ -200,6 +200,8 @@ function buildBudgetStatusNote(
       return `critical level (${pctLabel}) with ${dayLabel}`;
     case "exhausted":
       return `budget exhausted with ${dayLabel}`;
+    case "unbudgeted":
+      return `no budget configured — running freely with ${dayLabel}`;
   }
 }
 
@@ -213,6 +215,8 @@ function economyGuidance(status: ShiftContext["economy"]["budget_status"]): stri
       return ["Essential work only", "Flag blockers to user", "Conservative decisions"];
     case "exhausted":
       return ["Do not start new runs", "Escalate to user for budget", "Document what's blocked"];
+    case "unbudgeted":
+      return ["No budget limits configured", "Normal operations", "Full autonomy"];
   }
 }
 

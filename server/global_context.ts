@@ -81,7 +81,7 @@ export type GlobalProjectSummary = {
   health: HealthStatus;
   health_summary: ProjectHealth;
   budget: {
-    status: "healthy" | "warning" | "critical" | "exhausted";
+    status: "healthy" | "warning" | "critical" | "exhausted" | "unbudgeted";
     remaining_usd: number;
     allocation_usd: number;
     daily_drip_usd: number;
@@ -146,6 +146,7 @@ export type GlobalContextResponse = {
     projects_warning: number;
     projects_critical: number;
     projects_exhausted: number;
+    projects_unbudgeted: number;
     portfolio_burn_rate_daily_usd: number;
     portfolio_runway_days: number;
   };
@@ -494,6 +495,7 @@ export function buildGlobalContextResponse(): GlobalContextResponse {
     warning: 0,
     critical: 0,
     exhausted: 0,
+    unbudgeted: 0,
   };
 
   for (const project of summaries) {
@@ -738,6 +740,7 @@ export function buildGlobalContextResponse(): GlobalContextResponse {
       projects_warning: budgetStatusCounts.warning,
       projects_critical: budgetStatusCounts.critical,
       projects_exhausted: budgetStatusCounts.exhausted,
+      projects_unbudgeted: budgetStatusCounts.unbudgeted,
       portfolio_burn_rate_daily_usd: portfolioBurnRateDaily,
       portfolio_runway_days: portfolioRunwayDays,
     },

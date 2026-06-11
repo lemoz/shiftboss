@@ -399,7 +399,7 @@ type GlobalContextResponse = {
     status: string;
     health: string;
     budget: {
-      status: "healthy" | "warning" | "critical" | "exhausted";
+      status: "healthy" | "warning" | "critical" | "exhausted" | "unbudgeted";
       remaining_usd: number;
       allocation_usd: number;
       daily_drip_usd: number;
