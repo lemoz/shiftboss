@@ -118,6 +118,8 @@ export type RunRow = {
     | "reviewer_approved"
     | "committed"
     | null;
+  last_completed_iteration: number | null;
+  worker_pid: number | null;
 };
 
 export type SignalRow = {
@@ -2370,6 +2372,14 @@ function initSchema(database: Database.Database) {
   if (!hasLastCompletedPhase) {
     database.exec("ALTER TABLE runs ADD COLUMN last_completed_phase TEXT;");
   }
+  const hasLastCompletedIteration = runColumns.some((c) => c.name === "last_completed_iteration");
+  if (!hasLastCompletedIteration) {
+    database.exec("ALTER TABLE runs ADD COLUMN last_completed_iteration INTEGER;");
+  }
+  const hasWorkerPid = runColumns.some((c) => c.name === "worker_pid");
+  if (!hasWorkerPid) {
+    database.exec("ALTER TABLE runs ADD COLUMN worker_pid INTEGER;");
+  }
 
   const escalationColumns = database
     .prepare("PRAGMA table_info(escalations)")
@@ -3133,11 +3143,16 @@ export function createRun(run: RunRow): void {
   database
     .prepare(
       `INSERT INTO runs
-        (id, project_id, work_order_id, provider, triggered_by, status, iteration, builder_iteration, reviewer_verdict, reviewer_notes, summary, estimated_iterations, estimated_minutes, estimate_confidence, estimate_reasoning, current_eta_minutes, estimated_completion_at, eta_history, branch_name, source_branch, pr_url, merge_status, conflict_with_run_id, run_dir, log_path, created_at, started_at, finished_at, error, failure_category, failure_reason, failure_detail, escalation, last_completed_phase)
+        (id, project_id, work_order_id, provider, triggered_by, status, iteration, builder_iteration, reviewer_verdict, reviewer_notes, summary, estimated_iterations, estimated_minutes, estimate_confidence, estimate_reasoning, current_eta_minutes, estimated_completion_at, eta_history, branch_name, source_branch, pr_url, merge_status, conflict_with_run_id, run_dir, log_path, created_at, started_at, finished_at, error, failure_category, failure_reason, failure_detail, escalation, last_completed_phase, last_completed_iteration, worker_pid)
        VALUES
-        (@id, @project_id, @work_order_id, @provider, @triggered_by, @status, @iteration, @builder_iteration, @reviewer_verdict, @reviewer_notes, @summary, @estimated_iterations, @estimated_minutes, @estimate_confidence, @estimate_reasoning, @current_eta_minutes, @estimated_completion_at, @eta_history, @branch_name, @source_branch, @pr_url, @merge_status, @conflict_with_run_id, @run_dir, @log_path, @created_at, @started_at, @finished_at, @error, @failure_category, @failure_reason, @failure_detail, @escalation, @last_completed_phase)`
+        (@id, @project_id, @work_order_id, @provider, @triggered_by, @status, @iteration, @builder_iteration, @reviewer_verdict, @reviewer_notes, @summary, @estimated_iterations, @estimated_minutes, @estimate_confidence, @estimate_reasoning, @current_eta_minutes, @estimated_completion_at, @eta_history, @branch_name, @source_branch, @pr_url, @merge_status, @conflict_with_run_id, @run_dir, @log_path, @created_at, @started_at, @finished_at, @error, @failure_category, @failure_reason, @failure_detail, @escalation, @last_completed_phase, @last_completed_iteration, @worker_pid)`
     )
-    .run({ ...run, pr_url: run.pr_url ?? null });
+    .run({
+      ...run,
+      pr_url: run.pr_url ?? null,
+      last_completed_iteration: run.last_completed_iteration ?? null,
+      worker_pid: run.worker_pid ?? null,
+    });
 }
 
 export function createCostRecord(record: CostRecord): void {
@@ -4718,6 +4733,8 @@ export function updateRun(
       | "failure_detail"
       | "escalation"
       | "last_completed_phase"
+      | "last_completed_iteration"
+      | "worker_pid"
     >
   >
 ): boolean {
@@ -4748,6 +4765,8 @@ export function updateRun(
     { key: "failure_detail", column: "failure_detail" },
     { key: "escalation", column: "escalation" },
     { key: "last_completed_phase", column: "last_completed_phase" },
+    { key: "last_completed_iteration", column: "last_completed_iteration" },
+    { key: "worker_pid", column: "worker_pid" },
   ];
   const sets = fields
     .filter((f) => patch[f.key] !== undefined)
@@ -5855,19 +5874,50 @@ export function markWorkOrderRunsMerged(projectId: string, workOrderId: string):
   return result.changes;
 }
 
-export function markInProgressRunsFailed(reason: string): number {
+export function markInProgressRunsFailed(
+  reason: string,
+  isWorkerAlive?: (runDir: string) => boolean
+): number {
   const database = getDb();
   const now = new Date().toISOString();
-  const result = database
+
+  if (!isWorkerAlive) {
+    // Legacy path: bulk-fail all in-progress runs without pid check.
+    const result = database
+      .prepare(
+        `UPDATE runs
+         SET status = 'failed',
+             error = ?,
+             finished_at = COALESCE(finished_at, ?)
+         WHERE status IN ('queued', 'building', 'ai_review', 'testing', 'waiting_for_input')`
+      )
+      .run(reason, now);
+    return result.changes;
+  }
+
+  // Pid-aware path: only fail runs whose worker process is no longer alive.
+  const inProgressRuns = database
     .prepare(
-      `UPDATE runs
-       SET status = 'failed',
-           error = ?,
-           finished_at = COALESCE(finished_at, ?)
+      `SELECT id, run_dir FROM runs
        WHERE status IN ('queued', 'building', 'ai_review', 'testing', 'waiting_for_input')`
     )
-    .run(reason, now);
-  return result.changes;
+    .all() as Array<{ id: string; run_dir: string }>;
+
+  let count = 0;
+  const update = database.prepare(
+    `UPDATE runs
+     SET status = 'failed',
+         error = ?,
+         finished_at = COALESCE(finished_at, ?)
+     WHERE id = ?`
+  );
+  for (const row of inProgressRuns) {
+    if (!isWorkerAlive(row.run_dir)) {
+      update.run(reason, now, row.id);
+      count++;
+    }
+  }
+  return count;
 }
 
 export function getSetting(key: string): SettingRow | null {

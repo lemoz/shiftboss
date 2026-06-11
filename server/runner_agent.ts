@@ -3307,6 +3307,47 @@ function copyLocalTestArtifacts(params: {
   }
 }
 
+const PHASE_ORDER_CONST = ["setup", "builder", "test", "reviewer_approved", "committed"] as const;
+type PhaseName = typeof PHASE_ORDER_CONST[number];
+
+/**
+ * Pure helper: given a checkpoint (phase + iteration) and a candidate loop
+ * iteration, compute whether builder and test phases should be skipped.
+ *
+ * Extracted for unit-testability; the runRun loop delegates to this.
+ *
+ * @param checkpointPhase - last_completed_phase from the DB (null = no checkpoint)
+ * @param checkpointIteration - last_completed_iteration from the DB (null = legacy row)
+ * @param loopIteration - the iteration currently being considered in the loop
+ * @param runIteration - run.iteration at resume time (used as fallback when checkpointIteration is null)
+ */
+export function resolveResumeSkips(
+  checkpointPhase: string | null,
+  checkpointIteration: number | null,
+  loopIteration: number,
+  runIteration: number
+): { skipBuilder: boolean; skipTests: boolean } {
+  const phaseIndex = (p: string | null): number =>
+    p ? PHASE_ORDER_CONST.indexOf(p as PhaseName) : -1;
+  const resumeIndex = phaseIndex(checkpointPhase);
+  if (resumeIndex < 0) return { skipBuilder: false, skipTests: false };
+
+  // Which iteration are we resuming from?
+  const resumeIteration = Math.max(1, checkpointIteration ?? runIteration);
+
+  // Only skip phases when we're on the iteration the checkpoint was recorded for.
+  // If checkpointIteration is null (legacy row), behave as before (trust runIteration).
+  const iterationMatches =
+    checkpointIteration === null
+      ? loopIteration === resumeIteration
+      : loopIteration === checkpointIteration;
+
+  return {
+    skipBuilder: iterationMatches && resumeIndex >= phaseIndex("builder"),
+    skipTests: iterationMatches && resumeIndex >= phaseIndex("test"),
+  };
+}
+
 export async function runRun(runId: string) {
   const run = getRunById(runId);
   if (!run) return;
@@ -3368,9 +3409,8 @@ export async function runRun(runId: string) {
 
     // Resume detection: determine which phases to skip
     const resumePhase = run.last_completed_phase;
-    const PHASE_ORDER = ["setup", "builder", "test", "reviewer_approved", "committed"] as const;
     const phaseIndex = (p: string | null) =>
-      p ? PHASE_ORDER.indexOf(p as typeof PHASE_ORDER[number]) : -1;
+      p ? PHASE_ORDER_CONST.indexOf(p as PhaseName) : -1;
     const resumeIndex = phaseIndex(resumePhase);
     const isResume = resumeIndex >= 0;
     if (isResume) {
@@ -3722,9 +3762,14 @@ export async function runRun(runId: string) {
 
     let finalIteration = skipIterationLoop ? run.iteration : 1;
 
-    // Determine the iteration to resume from (for builder/test resume)
+    // Determine the iteration to resume from (for builder/test resume).
+    // resumeIteration is the iteration number recorded alongside the checkpoint phase.
+    // We prefer last_completed_iteration when present; fall back to run.iteration for
+    // rows written before this column existed (treating them conservatively).
     const resumeIteration =
-      isResume && !skipIterationLoop ? Math.max(1, run.iteration) : 0;
+      isResume && !skipIterationLoop
+        ? Math.max(1, run.last_completed_iteration ?? run.iteration)
+        : 0;
 
     for (let iteration = skipIterationLoop ? maxIterations + 1 : 1; iteration <= maxIterations; iteration++) {
       // On resume, skip iterations before the one that was in progress
@@ -3732,9 +3777,13 @@ export async function runRun(runId: string) {
         log(`Skipping iteration ${iteration} (already completed in previous attempt)`);
         continue;
       }
-      const isResumeIteration = resumeIteration > 0 && iteration === resumeIteration;
-      const skipBuilder = isResumeIteration && resumeIndex >= phaseIndex("builder");
-      const skipTests = isResumeIteration && resumeIndex >= phaseIndex("test");
+      // Only skip builder/tests when the checkpoint explicitly belongs to THIS iteration.
+      const { skipBuilder, skipTests } = resolveResumeSkips(
+        run.last_completed_phase,
+        run.last_completed_iteration,
+        iteration,
+        run.iteration
+      );
 
       finalIteration = iteration;
       updateRun(runId, {
@@ -3940,7 +3989,7 @@ export async function runRun(runId: string) {
           startedAt: builderStartedAt,
           log,
         });
-        updateRun(runId, { last_completed_phase: "builder" });
+        updateRun(runId, { last_completed_phase: "builder", last_completed_iteration: iteration });
         const builderEndedAt = new Date();
         builderDurationSeconds = durationSeconds(builderStartedAt, builderEndedAt);
         etaActualTotals.builder_seconds += builderDurationSeconds;
@@ -4063,7 +4112,7 @@ export async function runRun(runId: string) {
         }
 
         testFailureOutput = null;
-        updateRun(runId, { last_completed_phase: "test" });
+        updateRun(runId, { last_completed_phase: "test", last_completed_iteration: iteration });
       } else {
         log("Skipping tests (already passed in previous attempt)");
       }
@@ -4293,7 +4342,7 @@ export async function runRun(runId: string) {
 
       if (reviewerVerdict === "approved") {
         approvedSummary = builderResult?.summary || "(no builder summary)";
-        updateRun(runId, { last_completed_phase: "reviewer_approved" });
+        updateRun(runId, { last_completed_phase: "reviewer_approved", last_completed_iteration: iteration });
         log(`Reviewer approved on iteration ${iteration}`);
         break;
       }
@@ -4464,7 +4513,7 @@ export async function runRun(runId: string) {
         });
         return;
       }
-      updateRun(runId, { last_completed_phase: "committed" });
+      updateRun(runId, { last_completed_phase: "committed", last_completed_iteration: finalIteration });
     } else {
       log("Skipping commit (already committed in previous attempt)");
     }
@@ -5317,6 +5366,8 @@ export function enqueueCodexRun(
     failure_detail: null,
     escalation: null,
     last_completed_phase: null,
+    last_completed_iteration: null,
+    worker_pid: null,
   };
 
   createRun(run);
@@ -5327,6 +5378,7 @@ export function enqueueCodexRun(
       throw new Error("runner worker pid unavailable");
     }
     writeRunnerPid(runDir, worker.pid);
+    updateRun(id, { worker_pid: worker.pid });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     updateRun(id, {
@@ -5580,6 +5632,18 @@ function isProcessAlive(target: number): boolean {
     if (code === "EPERM") return true;
     throw err;
   }
+}
+
+/**
+ * Returns true if the detached runner worker for the given run directory is
+ * still alive according to the pid file.  Used by restart-recovery code in
+ * index.ts to avoid blanket-failing runs whose workers survived a server
+ * restart.
+ */
+export function isRunWorkerAlive(runDir: string): boolean {
+  const pid = readRunnerPid(runDir);
+  if (!pid) return false;
+  return isProcessAlive(killTargetForPid(pid));
 }
 
 async function waitForExit(target: number, timeoutMs: number): Promise<boolean> {
@@ -5890,6 +5954,7 @@ export function resumeSecurityHoldRun(runId: string): SecurityHoldActionResult {
       throw new Error("runner worker pid unavailable");
     }
     writeRunnerPid(run.run_dir, worker.pid);
+    updateRun(runId, { worker_pid: worker.pid });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Failed to resume security hold: ${message}`);
@@ -5979,9 +6044,22 @@ export function resumeRun(runId: string): ResumeRunResult {
   }
 
   const log = (line: string) => appendLog(run.log_path, line);
+
+  // 5. Refuse to spawn a second worker if the original is still alive.
+  const existingPid = readRunnerPid(run.run_dir);
+  if (existingPid && isProcessAlive(killTargetForPid(existingPid))) {
+    return {
+      ok: false,
+      error: "runner still active for this run",
+      code: "resume_failed",
+    };
+  }
+  clearRunnerPid(run.run_dir);
+
   log(`Resuming run from checkpoint: last_completed_phase="${run.last_completed_phase}"`);
 
-  // Reset run fields for re-execution; keep last_completed_phase so the worker knows where to resume
+  // Reset run fields for re-execution; keep last_completed_phase and last_completed_iteration
+  // so the worker knows where to resume.
   updateRun(runId, {
     status: "building",
     error: null,
@@ -5999,6 +6077,7 @@ export function resumeRun(runId: string): ResumeRunResult {
       throw new Error("runner worker pid unavailable");
     }
     writeRunnerPid(run.run_dir, worker.pid);
+    updateRun(runId, { worker_pid: worker.pid });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`Failed to resume run: ${message}`);
@@ -6115,11 +6194,17 @@ export const __test__ = {
   ensureWorktreeLink,
   findEscalationRequest,
   isDeniedRelPath,
+  isProcessAlive,
+  isRunWorkerAlive,
+  killTargetForPid,
   mergeContextFiles,
   parseProjectBuilderEnv,
   parsePullRequestUrl,
+  readRunnerPid,
   removeWorktreeLink,
   resolveProjectBuilderSandboxMode,
+  resolveResumeSkips,
   resolveWorktreePaths,
   resolveBaseBranch,
+  writeRunnerPid,
 };
