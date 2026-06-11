@@ -12,7 +12,7 @@ process.env.CONTROL_CENTER_DB_PATH = dbPath;
 process.env.PCC_DATABASE_PATH = dbPath;
 
 const { getDb } = await import("./db.ts");
-const { getHealthResponse } = await import("./health.ts");
+const { getHealthResponse, isValidHealthToken } = await import("./health.ts");
 const { getHeartbeatResponse } = await import("./observability.ts");
 
 after(() => {
@@ -54,4 +54,34 @@ test("heartbeat response returns activity fields", () => {
     response.last_activity === null || typeof response.last_activity === "string",
     true
   );
+});
+
+// --- isValidHealthToken: fail-closed security matrix ---
+
+test("isValidHealthToken: no configured token → always denies (fail closed)", () => {
+  // Even if a caller provides a token, no configured token means deny.
+  // This ensures SHIFTBOSS_ALLOW_REMOTE_HEALTH=1 without SHIFTBOSS_HEALTH_TOKEN
+  // does not silently expose operational data.
+  assert.equal(isValidHealthToken("", "", ""), false);
+  assert.equal(isValidHealthToken("", "sometoken", ""), false);
+  assert.equal(isValidHealthToken("", "", "sometoken"), false);
+  assert.equal(isValidHealthToken("", "secret", "secret"), false);
+});
+
+test("isValidHealthToken: correct query token → admits", () => {
+  assert.equal(isValidHealthToken("mysecret", "mysecret", ""), true);
+});
+
+test("isValidHealthToken: correct header token → admits", () => {
+  assert.equal(isValidHealthToken("mysecret", "", "mysecret"), true);
+});
+
+test("isValidHealthToken: wrong token → denies", () => {
+  assert.equal(isValidHealthToken("mysecret", "wrong", ""), false);
+  assert.equal(isValidHealthToken("mysecret", "", "wrong"), false);
+  assert.equal(isValidHealthToken("mysecret", "wrong", "wrong"), false);
+});
+
+test("isValidHealthToken: empty caller tokens with configured token → denies", () => {
+  assert.equal(isValidHealthToken("mysecret", "", ""), false);
 });

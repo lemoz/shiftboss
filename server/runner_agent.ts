@@ -90,6 +90,7 @@ import {
   type StreamMonitorContext,
   type StreamMonitorIncident,
 } from "./stream_monitor.js";
+import { executeAgentCli, killProcessTree } from "./agent_execution.js";
 
 const DEFAULT_MAX_BUILDER_ITERATIONS = 10;
 const BASELINE_MAX_ATTEMPTS = 2;
@@ -2551,13 +2552,9 @@ async function runCodexExec(params: {
   child.stdin?.end();
 
   // -----------------------------------------------------------------------
-  // Timeout machinery: SIGTERM → SIGKILL the whole process group on expiry.
-  //
-  // DEADLOCK FIX: we use a ref object (not a plain `let` variable) so TS
-  // does not narrow away the assignment inside the Promise executor.  The
-  // `settle` function is called unconditionally after the process closes so
-  // that `await timeoutKillPromise` never hangs on the normal (non-timeout)
-  // exit path (clearTimeout would otherwise leave the Promise unsettled).
+  // Timeout machinery: delegate to killProcessTree (agent_execution.ts) so
+  // the SIGCONT-before-SIGTERM → SIGKILL sequence and deadlock-free ref-object
+  // pattern live in exactly one place.
   // -----------------------------------------------------------------------
   let timedOut = false;
   const tkRef: { settle: (() => void) | null; handle: ReturnType<typeof setTimeout> | null } =
@@ -2571,18 +2568,7 @@ async function runCodexExec(params: {
           params.log?.(`[runner] codex exec timed out after ${params.timeoutMs}ms; killing process group`);
           const pid = child.pid;
           if (pid !== undefined) {
-            if (process.platform !== "win32") {
-              // SIGCONT first so signals reach SIGSTOPped processes
-              try { process.kill(-pid, "SIGCONT"); } catch { /* already gone */ }
-              try { process.kill(-pid, "SIGTERM"); } catch { /* already gone */ }
-              // wait RUNNER_TERMINATE_TIMEOUT_MS then SIGKILL
-              await new Promise<void>((r) => setTimeout(r, RUNNER_TERMINATE_TIMEOUT_MS));
-              if (child.exitCode === null) {
-                try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
-              }
-            } else {
-              try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
-            }
+            await killProcessTree(pid, params.log);
           }
           resolve();
         }, params.timeoutMs);
@@ -3509,7 +3495,15 @@ async function runRepoTests(
 
   // Apply port offset to avoid collisions when multiple runs execute in parallel
   const portOffset = getPortOffset(runId);
-  const child = spawn(npmCommand(), testInfo.args, {
+  const testTimeoutMs = getTestTimeoutMs();
+
+  // Delegate spawn + kill-tree to executeAgentCli (agent_execution.ts) so the
+  // SIGCONT-before-SIGTERM → SIGKILL sequence lives in one place.  Raw output
+  // is captured via onCost (fires after exit) for the log file and the
+  // trimmed-tail display; both are written once instead of byte-by-byte.
+  const result = await executeAgentCli({
+    command: npmCommand(),
+    args: testInfo.args,
     cwd: repoPath,
     env: {
       ...getProcessEnv(),
@@ -3519,56 +3513,15 @@ async function runRepoTests(
       E2E_OFFLINE_WEB_PORT: String(E2E_OFFLINE_WEB_PORT_BASE + portOffset),
       E2E_API_PORT: String(E2E_API_PORT_BASE + portOffset),
     },
-    stdio: ["ignore", "pipe", "pipe"],
-    // detached so we can kill the whole process group on timeout
-    detached: process.platform !== "win32",
+    timeoutMs: testTimeoutMs,
+    label,
+    onCost: (info) => {
+      if (info.stdout) logStream.write(info.stdout);
+      if (info.stderr) logStream.write(info.stderr);
+      if (info.stdout) outputCapture.pushChunk(Buffer.from(info.stdout, "utf8"));
+      if (info.stderr) outputCapture.pushChunk(Buffer.from(info.stderr, "utf8"));
+    },
   });
-
-  child.stdout?.on("data", (buf) => {
-    logStream.write(buf);
-    outputCapture.pushChunk(buf);
-  });
-  child.stderr?.on("data", (buf) => {
-    logStream.write(buf);
-    outputCapture.pushChunk(buf);
-  });
-
-  const testTimeoutMs = getTestTimeoutMs();
-  let testTimedOut = false;
-  // DEADLOCK FIX: ref object (not a plain let variable) so TS does not narrow
-  // away the assignment inside the Promise executor.  `settle` is called
-  // unconditionally after the process closes so `await testTimeoutKill` never
-  // hangs on the normal (non-timeout) exit path.
-  const ttRef: { settle: (() => void) | null; handle: ReturnType<typeof setTimeout> | null } =
-    { settle: null, handle: null };
-  const testTimeoutKill: Promise<void> = new Promise<void>((resolve) => {
-    ttRef.settle = resolve;
-    ttRef.handle = setTimeout(async () => {
-      if (child.exitCode !== null) { resolve(); return; }
-      testTimedOut = true;
-      const pid = child.pid;
-      if (pid !== undefined && process.platform !== "win32") {
-        try { process.kill(-pid, "SIGTERM"); } catch { /* already gone */ }
-        await new Promise<void>((r) => setTimeout(r, RUNNER_TERMINATE_TIMEOUT_MS));
-        if (child.exitCode === null) {
-          try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
-        }
-      } else if (pid !== undefined) {
-        try { process.kill(pid, "SIGTERM"); } catch { /* already gone */ }
-      }
-      resolve();
-    }, testTimeoutMs);
-  });
-
-  const exitCode: number = await new Promise((resolve) => {
-    child.on("close", (code) => resolve(code ?? 1));
-    child.on("error", () => resolve(1));
-  });
-
-  if (ttRef.handle) clearTimeout(ttRef.handle);
-  // Unblock the kill-promise on normal exit (see DEADLOCK FIX comment above).
-  ttRef.settle?.();
-  await testTimeoutKill;
 
   const captured = outputCapture.finalize();
   const outputTail = formatTestOutput(
@@ -3577,17 +3530,17 @@ async function runRepoTests(
     MAX_TEST_OUTPUT_LINES
   );
 
-  logStream.write(`[${nowIso()}] ${label} end exit=${exitCode} timedOut=${testTimedOut}\n`);
+  logStream.write(`[${nowIso()}] ${label} end exit=${result.exitCode} timedOut=${result.timedOut}\n`);
   logStream.end();
 
-  if (testTimedOut) {
+  if (result.timedOut) {
     throw new Error(`npm test timed out after ${testTimeoutMs}ms`);
   }
 
   return [
     {
       command: testInfo.command,
-      passed: exitCode === 0,
+      passed: result.exitCode === 0,
       output: outputTail,
     },
   ];

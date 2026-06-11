@@ -391,10 +391,22 @@ function buildRecallHeaders(config: RecallConfig): Record<string, string> {
   return headers;
 }
 
+/**
+ * Escape a string value so it is safe to embed inside a JSON string literal.
+ * JSON.stringify produces `"..."` — we strip the surrounding quotes to get the
+ * escaped inner content, then substitute that into the template in place of the
+ * `{key}` placeholder (which must already be inside a JSON string in the
+ * template).  This prevents user-controlled values from injecting extra keys or
+ * breaking the JSON structure.
+ */
+function jsonStringEscape(value: string): string {
+  return JSON.stringify(value).slice(1, -1);
+}
+
 function renderTemplate(template: string, values: Record<string, string>): string {
   let output = template;
   for (const [key, value] of Object.entries(values)) {
-    output = output.replaceAll(`{${key}}`, value);
+    output = output.replaceAll(`{${key}}`, jsonStringEscape(value));
   }
   return output;
 }
@@ -960,3 +972,10 @@ export async function stopMeetingOutputMedia(
   const updated = updateMeetingOutputMediaState(basePatch);
   return { ok: true, output_media: updated };
 }
+
+/** Exported for unit tests only — not part of the public API. */
+export const __test__ = {
+  jsonStringEscape,
+  renderTemplate,
+  parseTemplateJson,
+};

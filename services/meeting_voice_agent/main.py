@@ -40,6 +40,10 @@ class ServiceConfig:
     elevenlabs_tts_format: Optional[str]
     voice_agent_host: str
     voice_agent_port: int
+    # Shared token required on the WS handshake when the server is bound
+    # non-loopback (VOICE_AGENT_HOST != 127.0.0.1 / ::1).  Set via
+    # VOICE_AGENT_TOKEN.  If the host is loopback the token is optional.
+    voice_agent_token: Optional[str]
     audio: AudioConfig
     meeting_project_id: Optional[str]
     meeting_id: Optional[str]
@@ -359,8 +363,9 @@ def load_config() -> ServiceConfig:
         elevenlabs_stt_model_id=env("ELEVENLABS_STT_MODEL_ID"),
         elevenlabs_tts_model_id=env("ELEVENLABS_TTS_MODEL_ID"),
         elevenlabs_tts_format=env("ELEVENLABS_TTS_FORMAT"),
-        voice_agent_host=env("VOICE_AGENT_HOST", "0.0.0.0") or "0.0.0.0",
+        voice_agent_host=env("VOICE_AGENT_HOST", "127.0.0.1") or "127.0.0.1",
         voice_agent_port=parse_int_env("VOICE_AGENT_PORT", 8765),
+        voice_agent_token=(env("VOICE_AGENT_TOKEN") or "").strip() or None,
         audio=load_audio_config(),
         meeting_project_id=env("MEETING_PROJECT_ID"),
         meeting_id=env("MEETING_ID"),
@@ -574,12 +579,80 @@ def build_transport_params(audio: AudioConfig) -> Optional[Any]:
     )
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _is_loopback_host(host: str) -> bool:
+    return host.strip().lower() in _LOOPBACK_HOSTS
+
+
 def log_ws_connected(*_args, **_kwargs) -> None:
     LOG.info("WebSocket client connected.")
 
 
 def log_ws_disconnected(*_args, **_kwargs) -> None:
     LOG.info("WebSocket client disconnected.")
+
+
+def _make_token_connect_handler(
+    token: str,
+) -> Callable[..., Any]:
+    """
+    Return an on_connect callback that validates the ``?token=`` query parameter
+    on the WebSocket handshake.  If the token is missing or wrong the connection
+    is closed with code 4001 (Unauthorized) before any audio flows.
+
+    The Pipecat WebSocket transport calls on_connect with the websockets
+    connection object as the first positional argument.  We accept *args/**kwargs
+    so the callback is forward-compatible with transport variants that pass
+    additional arguments.
+    """
+
+    async def _check_token(*args: object, **kwargs: object) -> None:
+        # Locate the websockets connection object — first positional arg that
+        # has a ``request`` attribute (websockets >= 12) or a ``path``/``request_headers``
+        # attribute (older versions).
+        connection: Any = args[0] if args else None
+
+        def _get_query_token() -> Optional[str]:
+            # websockets >= 12: connection.request.path
+            if connection is None:
+                return None
+            request = getattr(connection, "request", None)
+            if request is not None:
+                raw_path = getattr(request, "path", "") or ""
+            else:
+                raw_path = getattr(connection, "path", "") or ""
+            if not raw_path:
+                return None
+            if "?" not in raw_path:
+                return None
+            query_string = raw_path.split("?", 1)[1]
+            for part in query_string.split("&"):
+                if "=" in part:
+                    key, _, val = part.partition("=")
+                    if key.strip() == "token":
+                        return val.strip()
+            return None
+
+        provided = _get_query_token()
+        if provided != token:
+            LOG.warning("WebSocket connection rejected: missing or invalid token.")
+            if connection is not None:
+                close = getattr(connection, "close", None)
+                if close is not None:
+                    try:
+                        import inspect as _inspect
+                        if _inspect.iscoroutinefunction(close):
+                            await close(4001, "Unauthorized")
+                        else:
+                            close(4001, "Unauthorized")
+                    except Exception:
+                        pass
+            return
+        LOG.info("WebSocket client connected.")
+
+    return _check_token
 
 
 def build_websocket_audio_transport(
@@ -607,6 +680,21 @@ def build_websocket_audio_transport(
     except ImportError:
         return None
 
+    # When bound non-loopback a token is required; log a warning if none is set.
+    host = config.voice_agent_host
+    token = config.voice_agent_token
+    if not _is_loopback_host(host) and not token:
+        LOG.warning(
+            "[security] VOICE_AGENT_HOST=%s is non-loopback but VOICE_AGENT_TOKEN is not set. "
+            "Set VOICE_AGENT_TOKEN to require authentication on the WebSocket handshake.",
+            host,
+        )
+
+    if token:
+        connect_handler: Callable[..., Any] = _make_token_connect_handler(token)
+    else:
+        connect_handler = log_ws_connected
+
     def handle_disconnect(*_args: object, **_kwargs: object) -> None:
         log_ws_disconnected()
         if on_disconnect:
@@ -627,11 +715,11 @@ def build_websocket_audio_transport(
         "frame_ms": config.audio.frame_duration_ms,
         "audio_format": config.audio.audio_format,
         "format": config.audio.audio_format,
-        "on_connect": log_ws_connected,
+        "on_connect": connect_handler,
         "on_disconnect": handle_disconnect,
-        "on_client_connected": log_ws_connected,
+        "on_client_connected": connect_handler,
         "on_client_disconnected": handle_disconnect,
-        "on_connection_open": log_ws_connected,
+        "on_connection_open": connect_handler,
         "on_connection_closed": handle_disconnect,
     }
     try:
