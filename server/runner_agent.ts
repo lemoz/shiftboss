@@ -2107,7 +2107,7 @@ function detectLinuxGateway(): string | null {
   return null;
 }
 
-function resolveProxyHosts(): { bindHost: string; proxyHost: string; containerMode: boolean } {
+function resolveProxyHosts(): { bindHost: string; proxyHost: string } {
   const bindHostOverride = (
     process.env.SHIFTBOSS_PROXY_BIND_HOST ||
     process.env.CONTROL_CENTER_PROXY_BIND_HOST ||
@@ -2122,31 +2122,11 @@ function resolveProxyHosts(): { bindHost: string; proxyHost: string; containerMo
     ""
   )
     .trim();
-  const containerMode = parseBooleanEnv(
-    process.env.SHIFTBOSS_BUILDER_CONTAINER ||
-      process.env.PCC_BUILDER_CONTAINER ||
-      process.env.CONTROL_CENTER_BUILDER_CONTAINER ||
-      process.env.PCC_CONTAINERIZED
-  );
-  const containerHostOverride = (
-    process.env.SHIFTBOSS_BUILDER_CONTAINER_HOST ||
-    process.env.PCC_BUILDER_CONTAINER_HOST ||
-    process.env.CONTROL_CENTER_BUILDER_CONTAINER_HOST ||
-    ""
-  )
-    .trim();
 
-  let bindHost = bindHostOverride || "127.0.0.1";
-  let proxyHost = proxyHostOverride || bindHost;
+  const bindHost = bindHostOverride || "127.0.0.1";
+  const proxyHost = proxyHostOverride || bindHost;
 
-  if (containerMode) {
-    bindHost = bindHostOverride || "0.0.0.0";
-    if (!proxyHostOverride) {
-      proxyHost = containerHostOverride || detectLinuxGateway() || "host.docker.internal";
-    }
-  }
-
-  return { bindHost, proxyHost, containerMode };
+  return { bindHost, proxyHost };
 }
 
 function resolveBuilderIdentity(
@@ -2193,38 +2173,21 @@ async function startBuilderNetworkProxy(params: {
   }
   let firewall: Awaited<ReturnType<typeof startNetworkWhitelistFirewall>> | null = null;
   let proxy: Awaited<ReturnType<typeof startNetworkWhitelistProxy>> | null = null;
-  const { bindHost, proxyHost: rawProxyHost, containerMode } = resolveProxyHosts();
+  const { bindHost, proxyHost } = resolveProxyHosts();
   const builderIdentity = resolveBuilderIdentity(params.worktreePath, params.log);
-  if (!builderIdentity && !containerMode) {
+  if (!builderIdentity) {
     const message =
       "Network whitelist enforcement requires root runner with a non-root worktree owner.";
     params.log?.(message);
     throw new Error(message);
-  }
-  if (!builderIdentity && containerMode) {
-    params.log?.("Container whitelist active without host UID restriction.");
-  }
-  let proxyHost = rawProxyHost;
-  if (containerMode && proxyHost && net.isIP(proxyHost) === 0) {
-    try {
-      const resolved = await dns.promises.lookup(proxyHost);
-      proxyHost = resolved.address;
-      params.log?.(`Resolved container proxy host ${rawProxyHost} -> ${proxyHost}.`);
-    } catch (err) {
-      params.log?.(
-        `Failed to resolve container proxy host ${rawProxyHost}: ${String(err)}`
-      );
-    }
   }
   try {
     firewall = await startNetworkWhitelistFirewall({
       whitelist,
       runId: params.runId,
       log: params.log,
-      containerMode,
       proxyOnly: true,
-      restrictUid: builderIdentity?.uid,
-      extraAllowHosts: containerMode && proxyHost ? [proxyHost] : [],
+      restrictUid: builderIdentity.uid,
       onViolation: (violation) => {
         const address = violation.address;
         const port = violation.port ? `:${violation.port}` : "";
@@ -2242,11 +2205,6 @@ async function startBuilderNetworkProxy(params: {
         "Network whitelist firewall unavailable; whitelist mode requires firewall enforcement.";
       params.log?.(message);
       throw new Error(message);
-    }
-    if (containerMode) {
-      params.log?.(
-        `Container builder mode active; proxy host set to ${proxyHost} (bind ${bindHost}).`
-      );
     }
     const startedProxy = await startNetworkWhitelistProxy({
       whitelist,

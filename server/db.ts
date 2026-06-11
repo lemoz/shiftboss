@@ -793,6 +793,8 @@ export type AgentMonitoringSettingsRow = {
   global_agent_network_access: string;
   global_agent_monitor_enabled: number;
   global_agent_auto_kill_on_threat: number;
+  chat_agent_monitor_enabled: number;
+  chat_agent_auto_kill_on_threat: number;
 };
 
 export type ShiftSchedulerSettingsRow = {
@@ -1518,7 +1520,9 @@ function initSchema(database: Database.Database) {
       shift_agent_auto_kill_on_threat INTEGER NOT NULL DEFAULT 1,
       global_agent_network_access TEXT NOT NULL DEFAULT 'full',
       global_agent_monitor_enabled INTEGER NOT NULL DEFAULT 1,
-      global_agent_auto_kill_on_threat INTEGER NOT NULL DEFAULT 1
+      global_agent_auto_kill_on_threat INTEGER NOT NULL DEFAULT 1,
+      chat_agent_monitor_enabled INTEGER NOT NULL DEFAULT 1,
+      chat_agent_auto_kill_on_threat INTEGER NOT NULL DEFAULT 1
     );
 
     CREATE TABLE IF NOT EXISTS network_whitelist (
@@ -2011,7 +2015,9 @@ function initSchema(database: Database.Database) {
        shift_agent_auto_kill_on_threat,
        global_agent_network_access,
        global_agent_monitor_enabled,
-       global_agent_auto_kill_on_threat)
+       global_agent_auto_kill_on_threat,
+       chat_agent_monitor_enabled,
+       chat_agent_auto_kill_on_threat)
     SELECT
       'global',
       'sandboxed',
@@ -2024,6 +2030,8 @@ function initSchema(database: Database.Database) {
       1,
       1,
       'full',
+      1,
+      1,
       1,
       1
     WHERE NOT EXISTS (SELECT 1 FROM agent_monitoring_settings);
@@ -2705,6 +2713,24 @@ function initSchema(database: Database.Database) {
   const hasShiftPid = shiftColumns.some((c) => c.name === "pid");
   if (!hasShiftPid && shiftColumns.length > 0) {
     database.exec("ALTER TABLE shifts ADD COLUMN pid INTEGER;");
+  }
+
+  // agent_monitoring_settings: add chat_agent columns introduced in
+  // containment-policy (Q1).  Guarded so existing installs upgrade cleanly.
+  const agentMonitoringColumns = database
+    .prepare("PRAGMA table_info(agent_monitoring_settings)")
+    .all() as Array<{ name: string }>;
+  if (agentMonitoringColumns.length > 0) {
+    if (!agentMonitoringColumns.some((c) => c.name === "chat_agent_monitor_enabled")) {
+      database.exec(
+        "ALTER TABLE agent_monitoring_settings ADD COLUMN chat_agent_monitor_enabled INTEGER NOT NULL DEFAULT 1;"
+      );
+    }
+    if (!agentMonitoringColumns.some((c) => c.name === "chat_agent_auto_kill_on_threat")) {
+      database.exec(
+        "ALTER TABLE agent_monitoring_settings ADD COLUMN chat_agent_auto_kill_on_threat INTEGER NOT NULL DEFAULT 1;"
+      );
+    }
   }
 }
 
@@ -6153,6 +6179,8 @@ const AGENT_MONITORING_DEFAULTS: AgentMonitoringSettingsRow = {
   global_agent_network_access: "full",
   global_agent_monitor_enabled: 1,
   global_agent_auto_kill_on_threat: 1,
+  chat_agent_monitor_enabled: 1,
+  chat_agent_auto_kill_on_threat: 1,
 };
 
 export function getAgentMonitoringSettingsRow(): AgentMonitoringSettingsRow {
@@ -6176,7 +6204,9 @@ export function getAgentMonitoringSettingsRow(): AgentMonitoringSettingsRow {
          shift_agent_auto_kill_on_threat,
          global_agent_network_access,
          global_agent_monitor_enabled,
-         global_agent_auto_kill_on_threat)
+         global_agent_auto_kill_on_threat,
+         chat_agent_monitor_enabled,
+         chat_agent_auto_kill_on_threat)
        VALUES
         (@id,
          @builder_network_access,
@@ -6190,7 +6220,9 @@ export function getAgentMonitoringSettingsRow(): AgentMonitoringSettingsRow {
          @shift_agent_auto_kill_on_threat,
          @global_agent_network_access,
          @global_agent_monitor_enabled,
-         @global_agent_auto_kill_on_threat)`
+         @global_agent_auto_kill_on_threat,
+         @chat_agent_monitor_enabled,
+         @chat_agent_auto_kill_on_threat)`
     )
     .run(AGENT_MONITORING_DEFAULTS);
   return { ...AGENT_MONITORING_DEFAULTS };
@@ -6219,7 +6251,9 @@ export function setAgentMonitoringSettingsRow(
            shift_agent_auto_kill_on_threat,
            global_agent_network_access,
            global_agent_monitor_enabled,
-           global_agent_auto_kill_on_threat)
+           global_agent_auto_kill_on_threat,
+           chat_agent_monitor_enabled,
+           chat_agent_auto_kill_on_threat)
          VALUES
           (@id,
            @builder_network_access,
@@ -6233,7 +6267,9 @@ export function setAgentMonitoringSettingsRow(
            @shift_agent_auto_kill_on_threat,
            @global_agent_network_access,
            @global_agent_monitor_enabled,
-           @global_agent_auto_kill_on_threat)`
+           @global_agent_auto_kill_on_threat,
+           @chat_agent_monitor_enabled,
+           @chat_agent_auto_kill_on_threat)`
       )
       .run(settings);
     return { ...settings };
@@ -6252,7 +6288,9 @@ export function setAgentMonitoringSettingsRow(
            shift_agent_auto_kill_on_threat = @shift_agent_auto_kill_on_threat,
            global_agent_network_access = @global_agent_network_access,
            global_agent_monitor_enabled = @global_agent_monitor_enabled,
-           global_agent_auto_kill_on_threat = @global_agent_auto_kill_on_threat`
+           global_agent_auto_kill_on_threat = @global_agent_auto_kill_on_threat,
+           chat_agent_monitor_enabled = @chat_agent_monitor_enabled,
+           chat_agent_auto_kill_on_threat = @chat_agent_auto_kill_on_threat`
     )
     .run(settings);
   return getAgentMonitoringSettingsRow();

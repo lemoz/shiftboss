@@ -46,7 +46,6 @@ docker compose ps
 
 docker compose logs -f api
 docker compose logs -f ui
-docker compose logs -f runner
 ```
 
 ## Start On Boot (systemd)
@@ -69,5 +68,7 @@ docker compose logs -f runner
 ## Notes
 - UI/API bind to localhost only. Remote access + auth is tracked in WO-2026-133.
 - If you mount additional repos, add extra bind mounts under `/repos` and keep `SHIFTBOSS_SCAN_ROOTS=/repos`.
-- Baseline sizing for UI/API/runner is 4 vCPU / 16 GB (see WO-2026-128 research).
-- `docker compose build` produces the `pcc-runner:latest` image via the runner service.
+- Baseline sizing for UI/API is 4 vCPU / 16 GB (see WO-2026-128 research).
+- Builders run as host processes inside the API container (no per-run Docker sandboxing).
+  Isolation is provided by codex --sandbox flags (workspace-write / read-only) and,
+  when whitelist mode is configured, an iptables OUTPUT rule scoped to the builder's UID.
