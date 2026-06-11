@@ -9,9 +9,6 @@ import type { ProjectNode } from "../playground/canvas/types";
 // Helpers
 // ---------------------------------------------------------------------------
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:4010";
-
 const HEALTH_COLORS: Record<string, string> = {
   healthy: "#22c55e",
   attention_needed: "#fbbf24",
@@ -112,12 +109,12 @@ type PanelData = {
 };
 
 // ---------------------------------------------------------------------------
-// Data loaders — fetch directly from API server (bypasses Next.js proxy)
+// Data loaders — route through Next.js proxy so ngrok/mobile access works
 // ---------------------------------------------------------------------------
 
 async function fetchShiftContext(projectId: string): Promise<ShiftContextResponse> {
   const res = await fetch(
-    `${API_BASE}/projects/${encodeURIComponent(projectId)}/shift-context`,
+    `/api/projects/${encodeURIComponent(projectId)}/shift-context`,
     { cache: "no-store" }
   );
   if (!res.ok) throw new Error("failed to load project context");
@@ -126,7 +123,7 @@ async function fetchShiftContext(projectId: string): Promise<ShiftContextRespons
 
 async function fetchActiveShift(projectId: string): Promise<ActiveShiftResponse> {
   const res = await fetch(
-    `${API_BASE}/projects/${encodeURIComponent(projectId)}/shifts/active`,
+    `/api/projects/${encodeURIComponent(projectId)}/shifts/active`,
     { cache: "no-store" }
   );
   if (!res.ok) return null;

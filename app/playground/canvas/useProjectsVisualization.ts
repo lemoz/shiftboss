@@ -557,28 +557,46 @@ export function useProjectsVisualization(): {
     }
   }, []);
 
-  const refreshActivity = useCallback(async () => {
+  // Tracks when the expensive shift-context was last fetched so we can rate-limit it.
+  const lastShiftRefreshRef = useRef<number>(0);
+
+  const refreshActivity = useCallback(async (forceShiftContext = false) => {
     if (refreshInFlight.current) return;
+    // Pause all polling while the tab is hidden — resumes automatically on next
+    // visible tick since the interval fires again when the page becomes active.
+    if (typeof document !== "undefined" && document.hidden) return;
     refreshInFlight.current = true;
     try {
       const nextProjects = await fetchRepos();
       setProjects(nextProjects);
 
+      const now = Date.now();
+      const shiftContextStale =
+        forceShiftContext || now - lastShiftRefreshRef.current >= 30_000;
+
       const [runResults, shiftResults, contextResult] = await Promise.all([
+        // Cheap: per-project run status — always refreshed at 5 s cadence.
         Promise.allSettled(
           nextProjects.map(async (project) => {
             const runs = await fetchRuns(project.id);
             return { projectId: project.id, runs };
           })
         ),
-        Promise.allSettled(
-          nextProjects.map(async (project) => {
-            const context = await fetchShiftContext(project.id);
-            return { projectId: project.id, context };
-          })
-        ),
+        // Expensive: full WO parse + DB sync — throttled to once per 30 s.
+        shiftContextStale
+          ? Promise.allSettled(
+              nextProjects.map(async (project) => {
+                const context = await fetchShiftContext(project.id);
+                return { projectId: project.id, context };
+              })
+            )
+          : Promise.resolve([] as PromiseSettledResult<{ projectId: string; context: ShiftContext | null }>[]),
         fetchGlobalContext().catch(() => null),
       ]);
+
+      if (shiftContextStale) {
+        lastShiftRefreshRef.current = now;
+      }
 
       const runsMap: Record<string, RunSummary[]> = {};
       for (const result of runResults) {
@@ -615,6 +633,8 @@ export function useProjectsVisualization(): {
   }, [load]);
 
   useEffect(() => {
+    // Cheap endpoints (repos + runs) poll every 5 s.
+    // Shift-context is throttled inside refreshActivity to 30 s.
     const interval = window.setInterval(() => {
       void refreshActivity();
     }, 5000);

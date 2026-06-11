@@ -625,6 +625,11 @@ export function ChatThread({
     access: ChatAccess;
   } | null>(null);
   const [sending, setSending] = useState(false);
+  const [heldSend, setHeldSend] = useState<{
+    pendingSendId: string;
+    requires: { write: boolean; network_allowlist: boolean };
+    canceling: boolean;
+  } | null>(null);
   const [applying, setApplying] = useState<Record<string, boolean>>({});
   const [undoing, setUndoing] = useState<Record<string, boolean>>({});
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
@@ -932,6 +937,7 @@ export function ChatThread({
     setSuggestionError(null);
     setPendingMessage(null);
     setPendingSelection(null);
+    setHeldSend(null);
   }, []);
 
   useEffect(() => {
@@ -982,7 +988,28 @@ export function ChatThread({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        const json = (await res.json().catch(() => null)) as { error?: string } | null;
+        const json = (await res.json().catch(() => null)) as {
+          error?: string;
+          pending_send_id?: string;
+          requires?: { write: boolean; network_allowlist: boolean };
+        } | null;
+        if (res.status === 409 && json?.pending_send_id) {
+          // Server held the send pending approval. Surface it so the user can
+          // see the held state and cancel if they change their mind.
+          setHeldSend({
+            pendingSendId: json.pending_send_id,
+            requires: json.requires ?? { write: false, network_allowlist: false },
+            canceling: false,
+          });
+          // Pre-check the confirmations the server is waiting on so the user
+          // only needs to re-send once they are ready.
+          setConfirmations((prev) => ({
+            write: json.requires?.write ? true : prev.write,
+            network_allowlist: json.requires?.network_allowlist ? true : prev.network_allowlist,
+          }));
+          setError(json.error ?? "Message held pending approval.");
+          return;
+        }
         if (!res.ok) throw new Error(json?.error || "failed to send");
         resetComposer();
         await load();
@@ -1202,6 +1229,25 @@ export function ChatThread({
     }
   }, [load]);
 
+  const cancelHeldSend = useCallback(async () => {
+    if (!heldSend) return;
+    setHeldSend((prev) => prev && { ...prev, canceling: true });
+    try {
+      const res = await fetch(
+        `/api/chat/threads/${encodeURIComponent(threadId)}/pending-sends/${encodeURIComponent(heldSend.pendingSendId)}/cancel`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+      );
+      const json = (await res.json().catch(() => null)) as { error?: string } | null;
+      if (!res.ok) throw new Error(json?.error || "failed to cancel held send");
+      // Held send successfully canceled — reset composer state.
+      resetComposer();
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "failed to cancel held send");
+      setHeldSend((prev) => prev && { ...prev, canceling: false });
+    }
+  }, [heldSend, resetComposer, threadId]);
+
   const renderJson = useCallback((raw: string | null) => {
     if (!raw) return "(none)";
     try {
@@ -1277,6 +1323,30 @@ export function ChatThread({
               </div>
             );
           })()}
+        </div>
+      )}
+
+      {!!heldSend && (
+        <div className="card" style={{ background: "rgba(251,191,36,0.06)", border: "1px solid rgba(251,191,36,0.3)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
+            <div style={{ fontWeight: 700 }}>Message held pending approval</div>
+            <div className="muted" style={{ fontSize: 12 }}>id: {heldSend.pendingSendId}</div>
+          </div>
+          <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+            This message was held by the server because it requires confirmation before sending.
+            {heldSend.requires.write && " Write access approval is needed."}
+            {heldSend.requires.network_allowlist && " Network allowlist approval is needed."}
+            {" "}Re-send with the confirmations checked, or cancel to discard.
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 10 }}>
+            <button
+              className="btnSecondary"
+              onClick={() => void cancelHeldSend()}
+              disabled={heldSend.canceling}
+            >
+              {heldSend.canceling ? "Canceling…" : "Cancel held send"}
+            </button>
+          </div>
         </div>
       )}
 
