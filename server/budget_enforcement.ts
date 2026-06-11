@@ -34,6 +34,7 @@ export type SurvivalModeState = {
 
 export type BudgetRunBlockReason =
   | "budget_exhausted"
+  | "global_budget_exhausted"
   | "budget_critical"
   | "survival_queue"
   | "survival_priority";
@@ -275,7 +276,9 @@ export function syncProjectBudgetAlerts(params: {
   const globalBudget = params.globalBudget ?? getGlobalBudget();
   const allocation = projectBudget.monthly_allocation_usd;
   const globalMonthly = globalBudget.monthly_budget_usd;
-  if (globalMonthly <= 0 && allocation <= 0) {
+  // Use the canonical budget_status enum rather than a raw numeric check so
+  // this guard stays in sync with getBudgetStatus's definition of 'unbudgeted'.
+  if (projectBudget.budget_status === "unbudgeted" && globalMonthly <= 0) {
     return;
   }
   const remaining = projectBudget.remaining_usd;
@@ -378,6 +381,54 @@ export function enforceRunBudget(params: {
     projectBudget,
     globalBudget,
   });
+
+  // Unbudgeted projects (no allocation configured, no global budget) are allowed
+  // to run freely — fresh installs must work out of the box.
+  if (projectBudget.budget_status === "unbudgeted" && globalBudget.monthly_budget_usd <= 0) {
+    return { mode: "normal", estimated_cost_usd: estimatedCost };
+  }
+
+  // Global budget enforcement: when a global monthly cap is set and the global
+  // remaining pool is exhausted, block all new runs regardless of per-project status.
+  if (
+    globalBudget.monthly_budget_usd > 0 &&
+    globalBudget.remaining_usd <= 0
+  ) {
+    const details: BudgetRunBlockDetails = {
+      block_reason: "global_budget_exhausted",
+      project_id: params.projectId,
+      work_order_id: params.workOrderId,
+      budget_status: projectBudget.budget_status,
+      remaining_usd: globalBudget.remaining_usd,
+      allocation_usd: globalBudget.monthly_budget_usd,
+      daily_drip_usd: 0,
+      estimated_cost_usd: estimatedCost,
+      next_available: null,
+      queued_runs: [],
+      queue_head: null,
+    };
+    createBudgetEnforcementLog({
+      project_id: params.projectId,
+      event_type: "run_blocked",
+      details: JSON.stringify({
+        reason: "global_budget_exhausted",
+        work_order_id: params.workOrderId,
+        global_remaining_usd: globalBudget.remaining_usd,
+        global_monthly_budget_usd: globalBudget.monthly_budget_usd,
+      }),
+    });
+    throw new BudgetEnforcementError(
+      `Global monthly budget exhausted (${formatUsd(globalBudget.remaining_usd)} remaining). Add more funds to continue.`,
+      "global_budget_exhausted",
+      details
+    );
+  }
+
+  // Unbudgeted project with a global budget set: allow it to draw from the
+  // unallocated global pool (global pool is not exhausted at this point).
+  if (projectBudget.budget_status === "unbudgeted") {
+    return { mode: "normal", estimated_cost_usd: estimatedCost };
+  }
 
   if (projectBudget.budget_status !== "exhausted") {
     const existingState = loadSurvivalState(params.projectId);

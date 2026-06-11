@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import fs from "fs";
-import { resolveModelPricing } from "./cost_pricing.js";
+import { resolveModelPricingConservative } from "./cost_pricing.js";
 import { createCostRecord, getDb, type CostCategory } from "./db.js";
 
 export type CostPeriod = "day" | "week" | "month" | "all_time";
@@ -63,6 +63,11 @@ export function recordCostEntry(params: {
   model: string;
   usage: TokenUsage | null;
   usageSource?: TokenUsageSource;
+  /** When present (e.g. from the Claude CLI's top-level total_cost_usd field),
+   *  this value is stored directly instead of re-deriving cost from token counts.
+   *  Token counts are still stored for reference.  Must be a finite non-negative
+   *  number to take effect. */
+  totalCostUsdOverride?: number;
   description?: string;
   createdAt?: string;
 }): void {
@@ -70,17 +75,31 @@ export function recordCostEntry(params: {
   const usageSource =
     params.usageSource ?? (params.usage ? "actual" : "missing");
   const isActual = usageSource === "actual";
-  const pricing = resolveModelPricing(params.model);
-  const inputCostPer1k = pricing?.input_cost_per_1k ?? 0;
-  const outputCostPer1k = pricing?.output_cost_per_1k ?? 0;
-  const totalCostUsd =
+  // Normalize empty model strings to "unknown" so the conservative fallback
+  // fires rather than logging an empty-string warning.
+  const modelKey = params.model?.trim() || "unknown";
+  // Conservative pricing: unknown models are charged the most expensive known
+  // rate so budget enforcement fails closed.  resolveModelPricingConservative
+  // always returns a non-null entry (never returns null).
+  const pricing = resolveModelPricingConservative(modelKey);
+  const inputCostPer1k = pricing.input_cost_per_1k;
+  const outputCostPer1k = pricing.output_cost_per_1k;
+  const derivedCostUsd =
     (usage.inputTokens / 1000) * inputCostPer1k +
     (usage.outputTokens / 1000) * outputCostPer1k;
+  // Prefer CLI-reported total_cost_usd when provided — it accounts for cache
+  // tokens and other adjustments we cannot reconstruct locally.
+  const totalCostUsd =
+    typeof params.totalCostUsdOverride === "number" &&
+    Number.isFinite(params.totalCostUsdOverride) &&
+    params.totalCostUsdOverride >= 0
+      ? params.totalCostUsdOverride
+      : derivedCostUsd;
 
   const notes: string[] = [];
   if (usageSource === "missing") notes.push("token usage missing");
   if (usageSource === "estimated") notes.push("token usage estimated");
-  if (!pricing) notes.push("pricing missing for model");
+  if (pricing.id === "unknown-fallback") notes.push("pricing missing for model (conservative fallback applied)");
   const description = combineDescription(params.description, notes);
 
   try {
@@ -175,24 +194,122 @@ export function parseCodexTokenUsageFromLog(logPath: string): TokenUsage | null 
   return null;
 }
 
-export function extractTokenUsageFromClaudeResponse(value: unknown): TokenUsage | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as Record<string, unknown>;
-  const candidates = [
-    record.usage,
-    record.token_usage,
-    record.usage_metadata,
-  ];
-  for (const candidate of candidates) {
-    const usage = parseUsageRecord(candidate);
-    if (usage) return normalizeUsage(usage);
-    if (candidate && typeof candidate === "object") {
-      const nested = candidate as Record<string, unknown>;
-      const nestedUsage = parseUsageRecord(nested.total_token_usage);
-      if (nestedUsage) return normalizeUsage(nestedUsage);
-    }
+/**
+ * Parse cost information from a Claude CLI stream-json log file.
+ *
+ * The Claude CLI with --output-format stream-json emits one JSON object per
+ * line.  The final "result" line contains a top-level cost_usd field and a
+ * usage object with full token counts including cache fields.  This function
+ * scans the log for that line and returns the parsed cost information.
+ */
+export function parseShiftCostFromStreamJsonLog(logPath: string): {
+  usage: TokenUsage | null;
+  totalCostUsd: number | null;
+  model: string | null;
+} {
+  let text = "";
+  try {
+    text = fs.readFileSync(logPath, "utf8");
+  } catch {
+    return { usage: null, totalCostUsd: null, model: null };
   }
-  return null;
+
+  const lines = text.split(/\r?\n/);
+  // Scan from the end — the result line is typically last.
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const trimmed = lines[i]?.trim();
+    if (!trimmed?.startsWith("{")) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") continue;
+    const record = parsed as Record<string, unknown>;
+    if (record.type !== "result") continue;
+
+    // Extract total_cost_usd / cost_usd.
+    const rawCost = record.total_cost_usd ?? record.cost_usd;
+    const totalCostUsd =
+      typeof rawCost === "number" && Number.isFinite(rawCost) && rawCost >= 0
+        ? rawCost
+        : null;
+
+    // Extract model if present.
+    const model = typeof record.model === "string" && record.model.trim() ? record.model.trim() : null;
+
+    // Extract usage with cache fields.
+    const { usage } = extractClaudeResponseCost(record);
+    return { usage, totalCostUsd, model };
+  }
+
+  return { usage: null, totalCostUsd: null, model: null };
+}
+
+export type ClaudeResponseCost = {
+  usage: TokenUsage | null;
+  totalCostUsd: number | null;
+};
+
+/**
+ * Parse token usage and, when present, the CLI-reported total_cost_usd from a
+ * Claude CLI JSON response.  Cache tokens (cache_creation_input_tokens,
+ * cache_read_input_tokens) are included in the returned inputTokens so that
+ * cost derivation from tokens accounts for the full prompt volume.  When the
+ * response carries a top-level total_cost_usd, that value is also returned so
+ * callers can pass it as totalCostUsdOverride to recordCostEntry.
+ */
+export function extractClaudeResponseCost(value: unknown): ClaudeResponseCost {
+  if (!value || typeof value !== "object") return { usage: null, totalCostUsd: null };
+  const record = value as Record<string, unknown>;
+
+  // Extract top-level total_cost_usd if present.
+  const rawTotal = record.total_cost_usd;
+  const totalCostUsd =
+    typeof rawTotal === "number" && Number.isFinite(rawTotal) && rawTotal >= 0
+      ? rawTotal
+      : null;
+
+  // Attempt to parse token counts, augmenting with cache fields.
+  const candidates = [record.usage, record.token_usage, record.usage_metadata];
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== "object") continue;
+    const c = candidate as Record<string, unknown>;
+
+    // Resolve the base input/output pair first.
+    const base = parseUsageRecord(c) ?? parseUsageRecord(c.total_token_usage);
+    if (!base) continue;
+
+    // Add cache tokens to input so pricing reflects the full prompt volume.
+    // Anthropic's usage.input_tokens excludes cached tokens; cache_creation
+    // costs ~1.25x the base input rate, cache_read ~0.1x. For simplicity we
+    // add them at face-value into inputTokens (slightly underestimates creation
+    // cost, overestimates read cost) so that budget sums are at least in the
+    // right order of magnitude.  When totalCostUsdOverride is provided the
+    // token-derived cost is not used anyway.
+    const cacheCreate = Number(c.cache_creation_input_tokens);
+    const cacheRead = Number(c.cache_read_input_tokens);
+    const extraInput =
+      (Number.isFinite(cacheCreate) && cacheCreate > 0 ? Math.trunc(cacheCreate) : 0) +
+      (Number.isFinite(cacheRead) && cacheRead > 0 ? Math.trunc(cacheRead) : 0);
+
+    const usage = normalizeUsage({
+      inputTokens: base.inputTokens + extraInput,
+      outputTokens: base.outputTokens,
+    });
+    return { usage, totalCostUsd };
+  }
+
+  return { usage: null, totalCostUsd };
+}
+
+/**
+ * Legacy shim — returns only the token usage portion.  Callers that also need
+ * total_cost_usd should switch to extractClaudeResponseCost.
+ */
+export function extractTokenUsageFromClaudeResponse(value: unknown): TokenUsage | null {
+  return extractClaudeResponseCost(value).usage;
 }
 
 function startOfUtcDay(date: Date): Date {

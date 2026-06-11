@@ -14,7 +14,7 @@ import {
   type RunRow,
 } from "./db.js";
 import {
-  extractTokenUsageFromClaudeResponse,
+  extractClaudeResponseCost,
   parseCodexTokenUsageFromLog,
   recordCostEntry,
   type TokenUsage,
@@ -1288,7 +1288,7 @@ async function runClaudePrompt(params: {
   projectPath: string;
   model: string;
   cliPath?: string;
-}): Promise<{ text: string; usage: TokenUsage | null }> {
+}): Promise<{ text: string; usage: TokenUsage | null; totalCostUsd: number | null }> {
   const result = await execFileAsync(
     claudeCommand(params.cliPath),
     ["-p", params.prompt, "--model", params.model, "--output-format", "json"],
@@ -1304,11 +1304,11 @@ async function runClaudePrompt(params: {
   try {
     parsed = JSON.parse(stdout) as unknown;
   } catch {
-    return { text: stdout, usage: null };
+    return { text: stdout, usage: null, totalCostUsd: null };
   }
-  const usage = extractTokenUsageFromClaudeResponse(parsed);
+  const { usage, totalCostUsd } = extractClaudeResponseCost(parsed);
   const text = extractClaudeText(parsed) ?? stdout;
-  return { text, usage };
+  return { text, usage, totalCostUsd };
 }
 
 export async function generateNarration(raw: unknown): Promise<NarrationResult> {
@@ -1429,6 +1429,7 @@ export async function generateNarration(raw: unknown): Promise<NarrationResult> 
       ? settings.model.trim() || DEFAULT_CODEX_MODEL
       : settings.model.trim() || CLAUDE_NARRATION_MODEL;
   let usage: TokenUsage | null = null;
+  let totalCostUsd: number | null = null;
 
   narrationInFlight = true;
   lastNarrationAt = now;
@@ -1451,6 +1452,7 @@ export async function generateNarration(raw: unknown): Promise<NarrationResult> 
         cliPath: settings.cliPath,
       });
       usage = result.usage;
+      totalCostUsd = result.totalCostUsd;
       text = result.text;
     }
 
@@ -1480,6 +1482,7 @@ export async function generateNarration(raw: unknown): Promise<NarrationResult> 
         category: "other",
         model,
         usage,
+        totalCostUsdOverride: totalCostUsd ?? undefined,
         description: "narration generation",
       });
     }

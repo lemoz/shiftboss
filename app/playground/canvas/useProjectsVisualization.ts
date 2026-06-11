@@ -53,7 +53,7 @@ export type GlobalContextProject = {
   status: "active" | "blocked" | "parked";
   health: ProjectHealthStatus;
   budget?: {
-    status: "healthy" | "warning" | "critical" | "exhausted";
+    status: "healthy" | "warning" | "critical" | "exhausted" | "unbudgeted";
     remaining_usd: number;
     allocation_usd: number;
     daily_drip_usd: number;
@@ -106,7 +106,7 @@ type ProjectCostSummary = {
 type ShiftEconomySummary = {
   budget_allocation_usd: number;
   budget_remaining_usd: number;
-  budget_status: "healthy" | "warning" | "critical" | "exhausted";
+  budget_status: "healthy" | "warning" | "critical" | "exhausted" | "unbudgeted";
   burn_rate_daily_usd: number;
   runway_days: number;
   period_days_remaining: number;
