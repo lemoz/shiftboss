@@ -4,6 +4,7 @@ import dns from "dns";
 import fs from "fs";
 import fg from "fast-glob";
 import net from "net";
+import os from "os";
 import path from "path";
 import YAML from "yaml";
 import {
@@ -25,6 +26,8 @@ import {
   getMergeLock,
   getRunById,
   listRunsByProject,
+  MERGE_LOCK_HEARTBEAT_INTERVAL_MS,
+  refreshMergeLockHeartbeat,
   releaseMergeLock,
   PROJECT_MERGE_POLICIES,
   type SecurityIncidentRow,
@@ -39,9 +42,11 @@ import {
 } from "./db.js";
 import {
   createScopeCreepDraftWorkOrder,
+  getWorkOrder,
   listWorkOrders,
   patchWorkOrder,
   readWorkOrderMarkdown,
+  WorkOrderError,
   type WorkOrder,
 } from "./work_orders.js";
 import { generateAndStoreHandoff, type RunOutcome } from "./handoff_generator.js";
@@ -891,70 +896,281 @@ function gitBranchExists(repoPath: string, branchName: string): boolean {
   return result.status === 0;
 }
 
+const DEFAULT_PROTECTED_PATHS = ["work_orders/", ".control.yml", ".control.yaml"];
+
+type StageSafeResult =
+  | { ok: true; staged: number }
+  | { ok: false; reason: "protected_path_violation"; violations: string[] };
+
+/**
+ * Safe staging: reset the index, parse `git status --porcelain -z` (NUL-separated,
+ * never C-quoted), skip deletions, check for protected-path violations, stage
+ * non-deletions in batches, and restore work_orders/ + .control.yml from HEAD.
+ *
+ * Exported via __test__ for unit testing.
+ */
+function stageSafeChanges(opts: {
+  worktreePath: string;
+  log: (line: string) => void;
+}): StageSafeResult {
+  const { worktreePath, log } = opts;
+
+  // Reset the index (builder or provider may have staged things already)
+  runGit(["reset", "HEAD"], { cwd: worktreePath, allowFailure: true, log });
+
+  // Use --porcelain -z so paths are NUL-separated and never C-quoted
+  const statusResult = runGit(["status", "--porcelain", "-z"], {
+    cwd: worktreePath,
+    allowFailure: true,
+  });
+  const filesToStage: string[] = [];
+  const deletedFiles: string[] = [];
+
+  // -z output: each entry is "<XY> <path>" terminated by NUL; for renames it is
+  // "<XY> <new>\0<old>" — we only need the first path per entry.
+  const raw = statusResult.stdout;
+  let i = 0;
+  while (i < raw.length) {
+    const nul = raw.indexOf("\0", i);
+    const entry = nul === -1 ? raw.slice(i) : raw.slice(i, nul);
+    i = nul === -1 ? raw.length : nul + 1;
+    if (entry.length < 3) continue;
+    const xy = entry.slice(0, 2);
+    const filePath = entry.slice(3);
+    if (!filePath) continue;
+    // Skip the second half of a rename pair (the old name)
+    if (xy[0] === "R" || xy[1] === "R" || xy[0] === "C" || xy[1] === "C") {
+      // consume the old-name NUL entry that follows
+      const nul2 = raw.indexOf("\0", i);
+      i = nul2 === -1 ? raw.length : nul2 + 1;
+    }
+    if (xy.includes("D")) {
+      deletedFiles.push(filePath);
+    } else {
+      filesToStage.push(filePath);
+    }
+  }
+
+  // Read protected_paths from HEAD version of .control.yml to prevent a
+  // builder-modified file from shrinking the protection set.
+  let projectProtectedPaths: string[] = [];
+  try {
+    for (const f of [".control.yml", ".control.yaml"]) {
+      const showResult = runGit(["show", `HEAD:${f}`], {
+        cwd: worktreePath,
+        allowFailure: true,
+      });
+      if (showResult.status === 0 && showResult.stdout) {
+        const parsed = YAML.parse(showResult.stdout);
+        if (Array.isArray(parsed?.protected_paths)) {
+          projectProtectedPaths = parsed.protected_paths;
+        }
+        break;
+      }
+    }
+  } catch { /* ignore parse errors */ }
+  const allProtectedPaths = [
+    ...new Set([...DEFAULT_PROTECTED_PATHS, ...projectProtectedPaths]),
+  ];
+
+  const protectedViolations: string[] = [];
+  for (const deleted of deletedFiles) {
+    for (const pp of allProtectedPaths) {
+      if (deleted === pp || deleted.startsWith(pp)) {
+        protectedViolations.push(deleted);
+        break;
+      }
+    }
+  }
+  if (protectedViolations.length > 0) {
+    // Attempt to restore the violated paths before returning
+    runGit(["checkout", "HEAD", "--", ...protectedViolations], {
+      cwd: worktreePath,
+      allowFailure: true,
+      log,
+    });
+    return { ok: false, reason: "protected_path_violation", violations: protectedViolations };
+  }
+
+  // Stage only modified/new files (skip deletions entirely)
+  const BATCH_SIZE = 50;
+  if (filesToStage.length > 0) {
+    for (let b = 0; b < filesToStage.length; b += BATCH_SIZE) {
+      const batch = filesToStage.slice(b, b + BATCH_SIZE);
+      runGit(["add", "--", ...batch], { cwd: worktreePath, log });
+    }
+  }
+
+  // Restore modified/deleted work_orders/ and .control.yml/.control.yaml from HEAD —
+  // builders keep changing these despite prompt instructions.
+  runGit(["checkout", "HEAD", "--", "work_orders/"], {
+    cwd: worktreePath,
+    allowFailure: true,
+    log,
+  });
+  runGit(["checkout", "HEAD", "--", ".control.yml", ".control.yaml"], {
+    cwd: worktreePath,
+    allowFailure: true,
+    // allowFailure: one or both of these files may not exist in HEAD
+  });
+
+  return { ok: true, staged: filesToStage.length };
+}
+
 function autoCommitDirtyWorkOrdersBeforeRun(params: {
   repoPath: string;
   sourceBranch: string;
+  /** When provided, the merge lock is held for the duration of the commit. */
+  projectId?: string;
+  /** When provided together with projectId, the merge lock is held for the duration of the commit. */
+  runId?: string;
   log: (line: string) => void;
 }) {
+  // Check whether work_orders/ has any uncommitted changes.
+  const statusResult = runGit(
+    ["status", "--porcelain", "-z", "--", "work_orders/"],
+    { cwd: params.repoPath, allowFailure: true }
+  );
+  if (statusResult.status !== 0) {
+    const detail =
+      statusResult.stderr.trim() || statusResult.stdout.trim() || "git status failed";
+    params.log(
+      `Warning: failed to inspect work_orders/ status before run: ${detail}; proceeding.`
+    );
+    return;
+  }
+  // -z separates records by NUL; an empty stdout means nothing dirty
+  if (!statusResult.stdout) return;
+
+  // Determine whether sourceBranch is currently checked out in the main repo.
   const currentBranchResult = runGit(["rev-parse", "--abbrev-ref", "HEAD"], {
     cwd: params.repoPath,
     allowFailure: true,
   });
   const currentBranch = currentBranchResult.stdout.trim();
-  if (!currentBranch || currentBranch === "HEAD") {
-    params.log(
-      "Warning: unable to determine current branch for work_orders auto-commit; proceeding."
-    );
+  const sourceIsCheckedOut = currentBranch === params.sourceBranch;
+
+  // Take the merge lock so this commit doesn't race a concurrent merge.
+  const lockAcquired =
+    params.projectId && params.runId
+      ? acquireMergeLock(params.projectId, params.runId)
+      : false;
+  const lockHeldHere = lockAcquired;
+
+  // If we intended to hold the lock (projectId + runId provided) but couldn't
+  // acquire it, skip the auto-commit to avoid racing a concurrent merge that
+  // holds the lock and may be mutating the main repo's working tree.
+  if (params.projectId && params.runId && !lockAcquired) {
+    params.log("Merge lock held by another run; skipping work_orders/ auto-commit.");
     return;
   }
-  let switchedToSourceBranch = false;
-  if (currentBranch !== params.sourceBranch) {
-    params.log(
-      `Source branch "${params.sourceBranch}" is not checked out (current: "${currentBranch}"); attempting temporary checkout for work_orders auto-commit.`
-    );
-    const checkoutSourceResult = runGit(["checkout", params.sourceBranch], {
-      cwd: params.repoPath,
-      allowFailure: true,
-    });
-    if (checkoutSourceResult.status !== 0) {
-      const detail =
-        checkoutSourceResult.stderr.trim() ||
-        checkoutSourceResult.stdout.trim() ||
-        "git checkout failed";
-      params.log(
-        `Warning: failed to checkout source branch "${params.sourceBranch}" for work_orders auto-commit: ${detail}; proceeding.`
+
+  if (sourceIsCheckedOut) {
+    // Source branch is the current checkout: commit directly without branch switch.
+    params.log(`Detected dirty work_orders/ on ${params.sourceBranch}; auto-committing.`);
+    try {
+      const addResult = runGit(["add", "--", "work_orders/"], {
+        cwd: params.repoPath,
+        allowFailure: true,
+      });
+      if (addResult.status !== 0) {
+        const detail = addResult.stderr.trim() || addResult.stdout.trim() || "git add failed";
+        params.log(`Warning: failed to stage work_orders/ for auto-commit: ${detail}; proceeding.`);
+        return;
+      }
+
+      const commitResult = runGit(
+        [
+          "-c",
+          "user.name=Shiftboss",
+          "-c",
+          "user.email=shiftboss@local",
+          "commit",
+          "-m",
+          "Auto-commit: work order metadata updates",
+          "--",
+          "work_orders/",
+        ],
+        { cwd: params.repoPath, allowFailure: true }
       );
-      return;
+      if (commitResult.status !== 0) {
+        const detail =
+          commitResult.stderr.trim() || commitResult.stdout.trim() || "git commit failed";
+        params.log(`Warning: work_orders/ auto-commit failed: ${detail}; proceeding.`);
+        return;
+      }
+      params.log("Auto-committed work_orders/ metadata updates.");
+    } finally {
+      if (lockHeldHere && params.projectId && params.runId) {
+        try {
+          releaseMergeLock(params.projectId, params.runId);
+        } catch { /* ignore */ }
+      }
     }
-    switchedToSourceBranch = true;
+    return;
   }
 
+  // Source branch differs from current checkout: use a temp worktree so we NEVER
+  // switch branches in the user's main working copy (G).
+  params.log(`Detected dirty work_orders/ on ${params.sourceBranch}; auto-committing via temp worktree.`);
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "shiftboss-wo-autocommit-"));
+  const tmpWtPath = path.join(tmpDir, "wt");
+  let worktreeCreated = false;
+
   try {
-    const statusResult = runGit(["status", "--porcelain", "--", "work_orders/"], {
-      cwd: params.repoPath,
-      allowFailure: true,
-    });
-    if (statusResult.status !== 0) {
-      const detail =
-        statusResult.stderr.trim() || statusResult.stdout.trim() || "git status failed";
+    const addWt = runGit(
+      ["worktree", "add", "--no-checkout", tmpWtPath, params.sourceBranch],
+      { cwd: params.repoPath, allowFailure: true }
+    );
+    if (addWt.status !== 0) {
+      const detail = addWt.stderr.trim() || addWt.stdout.trim() || "worktree add failed";
       params.log(
-        `Warning: failed to inspect work_orders/ status before run: ${detail}; proceeding.`
+        `Warning: failed to create temp worktree for work_orders auto-commit: ${detail}; proceeding.`
       );
       return;
     }
-    if (!statusResult.stdout.trim()) return;
+    worktreeCreated = true;
 
-    params.log(`Detected dirty work_orders/ on ${params.sourceBranch}; auto-committing.`);
+    // Populate the tracked work_orders/ files from HEAD into the temp worktree
+    runGit(["checkout", "HEAD", "--", "work_orders/"], {
+      cwd: tmpWtPath,
+      allowFailure: true,
+    });
+
+    // Overwrite with the dirty files from the main repo's working tree
+    const woSrcDir = path.join(params.repoPath, "work_orders");
+    const woDstDir = path.join(tmpWtPath, "work_orders");
+    if (fs.existsSync(woSrcDir)) {
+      try {
+        fs.cpSync(woSrcDir, woDstDir, { recursive: true });
+      } catch (err) {
+        params.log(
+          `Warning: failed to copy work_orders/ into temp worktree: ${String(err)}; proceeding.`
+        );
+        return;
+      }
+    }
 
     const addResult = runGit(["add", "--", "work_orders/"], {
-      cwd: params.repoPath,
+      cwd: tmpWtPath,
       allowFailure: true,
     });
     if (addResult.status !== 0) {
       const detail = addResult.stderr.trim() || addResult.stdout.trim() || "git add failed";
       params.log(
-        `Warning: failed to stage work_orders/ for auto-commit: ${detail}; proceeding.`
+        `Warning: failed to stage work_orders/ in temp worktree: ${detail}; proceeding.`
       );
+      return;
+    }
+
+    // Check if there's anything staged
+    const diffResult = runGit(["diff", "--cached", "--quiet"], {
+      cwd: tmpWtPath,
+      allowFailure: true,
+    });
+    if (diffResult.status === 0) {
+      // Nothing staged (files are identical to HEAD on sourceBranch)
       return;
     }
 
@@ -965,13 +1181,12 @@ function autoCommitDirtyWorkOrdersBeforeRun(params: {
         "-c",
         "user.email=shiftboss@local",
         "commit",
-        "--only",
         "-m",
         "Auto-commit: work order metadata updates",
         "--",
         "work_orders/",
       ],
-      { cwd: params.repoPath, allowFailure: true }
+      { cwd: tmpWtPath, allowFailure: true }
     );
     if (commitResult.status !== 0) {
       const detail =
@@ -980,20 +1195,23 @@ function autoCommitDirtyWorkOrdersBeforeRun(params: {
       return;
     }
 
-    params.log("Auto-committed work_orders/ metadata updates.");
+    params.log("Auto-committed work_orders/ metadata updates (no branch switch).");
   } finally {
-    if (switchedToSourceBranch) {
-      const restoreResult = runGit(["checkout", currentBranch], {
+    if (worktreeCreated) {
+      runGit(["worktree", "remove", "--force", tmpWtPath], {
         cwd: params.repoPath,
         allowFailure: true,
       });
-      if (restoreResult.status !== 0) {
-        const detail =
-          restoreResult.stderr.trim() || restoreResult.stdout.trim() || "git checkout failed";
-        params.log(
-          `Warning: failed to restore branch "${currentBranch}" after work_orders auto-commit: ${detail}; proceeding.`
-        );
-      }
+    }
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+    if (lockHeldHere && params.projectId && params.runId) {
+      try {
+        releaseMergeLock(params.projectId, params.runId);
+      } catch { /* ignore */ }
     }
   }
 }
@@ -3568,6 +3786,8 @@ export async function runRun(runId: string) {
       autoCommitDirtyWorkOrdersBeforeRun({
         repoPath,
         sourceBranch: baseBranch,
+        projectId: project.id,
+        runId,
         log,
       });
       try {
@@ -4387,11 +4607,12 @@ export async function runRun(runId: string) {
     // and destroy the uncommitted changes when the worktree is cleaned up.
     const skipCommit = resumeIndex >= phaseIndex("committed");
     if (!skipCommit) {
-      const statusOutput = runGit(["status", "--porcelain"], {
+      // Use --porcelain -z to detect any changes without C-quoting paths
+      const statusOutput = runGit(["status", "--porcelain", "-z"], {
         cwd: worktreePath,
         allowFailure: true,
       });
-      if (!statusOutput.stdout.trim()) {
+      if (!statusOutput.stdout) {
         log("No changes detected; skipping merge");
         cleanupWorktree({
           repoPath,
@@ -4417,55 +4638,11 @@ export async function runRun(runId: string) {
         return;
       }
 
-      // Safe staging: only add modified/new files, never deletions.
-      // First, reset the index so we start clean (builder or codex provider may have staged things).
-      runGit(["reset", "HEAD"], { cwd: worktreePath, allowFailure: true, log });
-      // Get list of modified (M), added (A), renamed (R), copied (C), and untracked (??) files.
-      const statusForStaging = runGit(["status", "--porcelain"], { cwd: worktreePath, allowFailure: true });
-      const filesToStage: string[] = [];
-      const deletedFiles: string[] = [];
-      for (const line of statusForStaging.stdout.split("\n")) {
-        if (!line.trim()) continue;
-        const status = line.slice(0, 2);
-        const filePath = line.slice(3).trim();
-        if (status.includes("D")) {
-          deletedFiles.push(filePath);
-        } else {
-          filesToStage.push(filePath);
-        }
-      }
-
-      // Check protected paths — abort if any were deleted
-      const DEFAULT_PROTECTED_PATHS = ["work_orders/", ".control.yml", ".control.yaml"];
-      let projectProtectedPaths: string[] = [];
-      try {
-        const controlYmlPath = [".control.yml", ".control.yaml"]
-          .map(f => path.join(worktreePath, f))
-          .find(f => fs.existsSync(f));
-        if (controlYmlPath) {
-          const parsed = YAML.parse(fs.readFileSync(controlYmlPath, "utf8"));
-          if (Array.isArray(parsed?.protected_paths)) {
-            projectProtectedPaths = parsed.protected_paths;
-          }
-        }
-      } catch { /* ignore parse errors */ }
-      const allProtectedPaths = [...new Set([...DEFAULT_PROTECTED_PATHS, ...projectProtectedPaths])];
-
-      const protectedViolations: string[] = [];
-      for (const deleted of deletedFiles) {
-        for (const pp of allProtectedPaths) {
-          if (deleted === pp || deleted.startsWith(pp)) {
-            protectedViolations.push(deleted);
-            break;
-          }
-        }
-      }
-
-      if (protectedViolations.length > 0) {
-        const violationList = protectedViolations.join(", ");
+      // Safe staging: reset index, skip deletions, protect critical paths, restore WOs.
+      const stageResult = stageSafeChanges({ worktreePath, log });
+      if (!stageResult.ok) {
+        const violationList = stageResult.violations.join(", ");
         log(`ABORT: Builder deleted protected paths: ${violationList}`);
-        // Restore the worktree to HEAD state for protected files
-        runGit(["checkout", "HEAD", "--", ...protectedViolations], { cwd: worktreePath, allowFailure: true, log });
         updateRun(runId, {
           status: "failed",
           error: `Builder attempted to delete protected paths: ${violationList}`,
@@ -4476,19 +4653,6 @@ export async function runRun(runId: string) {
         return;
       }
 
-      // Stage only modified/new files (skip deletions entirely)
-      if (filesToStage.length > 0) {
-        // Stage in batches to avoid arg length limits
-        const BATCH_SIZE = 50;
-        for (let i = 0; i < filesToStage.length; i += BATCH_SIZE) {
-          const batch = filesToStage.slice(i, i + BATCH_SIZE);
-          runGit(["add", "--", ...batch], { cwd: worktreePath, log });
-        }
-      }
-
-      // Restore modified/deleted work_orders/ files — builders keep changing WO files despite prompt instructions.
-      // `checkout HEAD` restores tracked files to their original state; new files (e.g. scope-creep WOs) are unaffected.
-      runGit(["checkout", "HEAD", "--", "work_orders/"], { cwd: worktreePath, allowFailure: true, log });
       const commitTitle = workOrder.title.replace(/\s+/g, " ").trim();
       const commitMessage = `${workOrder.id}: ${commitTitle || "Update"}`;
       const commitResult = runGit(
@@ -4744,7 +4908,24 @@ export async function runRun(runId: string) {
         };
       }
 
-      runGit(["add", "-A"], { cwd: worktreePath, log });
+      // Route through safe-staging so protected paths are guarded even in the
+      // conflict-resolution path (mirrors the normal commit path; replaces git add -A).
+      const conflictStageResult = stageSafeChanges({ worktreePath, log });
+      if (!conflictStageResult.ok) {
+        const violationList = conflictStageResult.violations.join(", ");
+        log(`ABORT: Merge builder deleted protected paths: ${violationList}`);
+        runGit(["merge", "--abort"], { cwd: worktreePath, allowFailure: true, log });
+        finishMergeConflict(
+          `Merge builder attempted to delete protected paths: ${violationList}`,
+          conflictDetails.conflictingRunId,
+          conflictFiles
+        );
+        return {
+          ok: false,
+          conflictRunId: conflictDetails.conflictingRunId,
+          conflictFiles,
+        };
+      }
       const mergeCommitResult = runGit(
         [
           "-c",
@@ -5026,72 +5207,54 @@ export async function runRun(runId: string) {
       await sleep(MERGE_LOCK_POLL_MS);
     }
 
-    const ensureCleanMainRepo = (): boolean => {
-      const status = runGit(["status", "--porcelain"], {
-        cwd: repoPath,
-        allowFailure: true,
-      });
-      if (!status.stdout.trim()) return true;
-      log("Main repo has uncommitted changes; refusing to auto-clean before merge.");
-      const dirtyLines = status.stdout
-        .trim()
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
-      const previewCount = Math.min(20, dirtyLines.length);
-      for (const line of dirtyLines.slice(0, previewCount)) {
-        log(`[dirty-main] ${line}`);
-      }
-      if (dirtyLines.length > previewCount) {
-        log(`[dirty-main] ... ${dirtyLines.length - previewCount} more entries`);
-      }
-      return false;
-    };
-
-    try {
-      if (!ensureCleanMainRepo()) {
-        finishMergeConflict(
-          "Main branch has uncommitted changes; merge aborted.",
-          conflictRunId,
-          conflictFiles
-        );
-        return;
-      }
-
+    // A: Start heartbeat interval so the lock is not stolen while we hold it.
+    // Refreshed every MERGE_LOCK_HEARTBEAT_INTERVAL_MS (60s); cleared in finally.
+    let heartbeatInterval: ReturnType<typeof setInterval> | null = setInterval(() => {
       try {
-        runGit(["checkout", baseBranch], { cwd: repoPath, log });
-      } catch (err) {
-        recordMergeOutcome("failed", { reason: "checkout_failed" });
-        updateRun(runId, {
-          status: "failed",
-          error: `git checkout failed: ${String(err)}`,
-          finished_at: nowIso(),
-          merge_status: null,
-        });
-        return;
+        const hbProjectId = resolveMergeLockProjectId();
+        refreshMergeLockHeartbeat(hbProjectId, runId);
+      } catch {
+        // ignore heartbeat errors; worst case the lock looks stale and gets reaped
+      }
+    }, MERGE_LOCK_HEARTBEAT_INTERVAL_MS);
+
+    const baseShaAfterLock = runGit(["rev-parse", baseBranch], {
+      cwd: repoPath,
+      allowFailure: true,
+    }).stdout.trim();
+    // If the worktree's merge-base is behind the current base tip, resync
+    const currentBaseShaInWt = runGit(["merge-base", branchName, baseBranch], {
+      cwd: worktreePath,
+      allowFailure: true,
+    }).stdout.trim();
+    try {
+      // B: Re-validate base SHA after acquiring the lock — a concurrent merge may have
+      // landed during the wait.  Re-sync if base moved.  This block is inside the
+      // try/finally so the lock is always released even if resync fails.
+      if (baseShaAfterLock && currentBaseShaInWt && baseShaAfterLock !== currentBaseShaInWt) {
+        log(`Base moved during lock wait (${currentBaseShaInWt.slice(0, 8)} → ${baseShaAfterLock.slice(0, 8)}); re-syncing branch.`);
+        const resyncResult = await mergeBaseIntoBranch();
+        if (!resyncResult.ok) {
+          recordMergeOutcome("failed", { reason: "resync_after_lock_failed" });
+          return;
+        }
+        if (resyncResult.conflictRunId) conflictRunId = resyncResult.conflictRunId;
+        if (resyncResult.conflictFiles.length) conflictFiles = resyncResult.conflictFiles;
+        writeMergeArtifacts();
       }
 
       const mergeTitle = workOrder.title.replace(/\s+/g, " ").trim();
       const mergeMessage = `Merge ${workOrder.id}: ${mergeTitle || "Update"}`;
-      const mergeArgs = [
-        "-c",
-        "user.name=Shiftboss Runner",
-        "-c",
-        "user.email=runner@local",
-        "merge",
+
+      // D: use mergeNoTouch — never modify the user's working copy
+      const mergeMain = mergeNoTouch({
+        repoPath,
+        baseBranch,
         branchName,
-        "--no-ff",
-        "-m",
         mergeMessage,
-      ];
-      const mergeMain = runGit(mergeArgs, { cwd: repoPath, allowFailure: true, log });
-      if (mergeMain.status !== 0) {
-        const mainConflictFiles = listUnmergedFiles(repoPath);
-        const mainConflictOutput = runGit(["diff"], {
-          cwd: repoPath,
-          allowFailure: true,
-        }).stdout;
-        runGit(["merge", "--abort"], { cwd: repoPath, allowFailure: true, log });
+        log,
+      });
+      if (!mergeMain.ok) {
         log("Merge to base branch failed; retrying after syncing branch");
 
         const retryResult = await mergeBaseIntoBranch();
@@ -5103,31 +5266,23 @@ export async function runRun(runId: string) {
         if (retryResult.conflictFiles.length) conflictFiles = retryResult.conflictFiles;
         writeMergeArtifacts();
 
-        if (!ensureCleanMainRepo()) {
-          finishMergeConflict(
-            "Main branch has uncommitted changes; merge aborted.",
-            conflictRunId,
-            conflictFiles
-          );
-          return;
-        }
-
-        const retryMergeMain = runGit(mergeArgs, {
-          cwd: repoPath,
-          allowFailure: true,
+        const retryMergeMain = mergeNoTouch({
+          repoPath,
+          baseBranch,
+          branchName,
+          mergeMessage,
           log,
         });
-        if (retryMergeMain.status !== 0) {
-          const retryConflictFiles = listUnmergedFiles(repoPath);
-          const retryConflictOutput = runGit(["diff"], {
-            cwd: repoPath,
-            allowFailure: true,
-          }).stdout;
-          runGit(["merge", "--abort"], { cwd: repoPath, allowFailure: true, log });
-          const finalConflictFiles = retryConflictFiles.length
-            ? retryConflictFiles
-            : mainConflictFiles;
-          const finalConflictOutput = retryConflictOutput || mainConflictOutput;
+        if (!retryMergeMain.ok) {
+          const finalConflictFiles = retryMergeMain.conflictFiles.length
+            ? retryMergeMain.conflictFiles
+            : mergeMain.conflictFiles;
+          // Capture diff context between the run branch and base for the conflict reviewer.
+          // The temp worktree is gone, so use the source worktree diff instead.
+          const gitConflictOutput = runGit(
+            ["diff", `${baseBranch}...${branchName}`],
+            { cwd: worktreePath, allowFailure: true }
+          ).stdout;
           const conflictDetails = buildConflictContext({
             repoPath,
             runId,
@@ -5135,14 +5290,14 @@ export async function runRun(runId: string) {
             workOrder,
             approvedSummary,
             conflictFiles: finalConflictFiles.length ? finalConflictFiles : conflictFiles,
-            gitConflictOutput: finalConflictOutput,
+            gitConflictOutput,
           });
           writeJson(path.join(runDir, "merge_conflict.json"), conflictDetails.conflictContext);
           if (conflictDetails.conflictingRunId) {
             conflictRunId = conflictDetails.conflictingRunId;
           }
           finishMergeConflict(
-            `Merge to ${baseBranch} failed: ${retryMergeMain.stderr || retryMergeMain.stdout}`,
+            `Merge to ${baseBranch} failed: ${retryMergeMain.error}`,
             conflictRunId,
             finalConflictFiles.length ? finalConflictFiles : conflictFiles
           );
@@ -5172,6 +5327,11 @@ export async function runRun(runId: string) {
       recordMergeOutcome("success");
       log("Run completed and approved");
     } finally {
+      // A: always clear heartbeat before releasing lock
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+      }
       if (mergeLockAcquired) {
         try {
           const currentProjectId = resolveMergeLockProjectId();
@@ -5688,6 +5848,186 @@ async function terminateRunner(pid: number, log: (line: string) => void): Promis
   return killed ? { ok: true } : { ok: false, error: "runner did not exit after SIGKILL" };
 }
 
+/**
+ * Detect whether the repo has a MERGE_HEAD (left by a killed/crashed merge) and
+ * abort it.  Returns true if an in-progress merge was found and aborted.
+ * Used both at lock acquisition time (H) and on server startup.
+ */
+export function abortStaleMergeHead(repoPath: string, log: (line: string) => void): boolean {
+  const mergeHeadPath = path.join(repoPath, ".git", "MERGE_HEAD");
+  if (!fs.existsSync(mergeHeadPath)) return false;
+  log(`[merge-recovery] Detected stale MERGE_HEAD in ${repoPath}; aborting.`);
+  const result = runGit(["merge", "--abort"], { cwd: repoPath, allowFailure: true, log });
+  if (result.status !== 0) {
+    log(`[merge-recovery] git merge --abort failed: ${result.stderr || result.stdout}`);
+  }
+  return true;
+}
+
+type MergeNoTouchResult =
+  | { ok: true }
+  | { ok: false; error: string; isConflict: boolean; conflictFiles: string[] };
+
+/**
+ * Merge `branchName` into `baseBranch` WITHOUT switching branches in the user's
+ * main working copy.
+ *
+ * Strategy:
+ *   - If `baseBranch` is NOT currently checked out → create a temporary detached
+ *     worktree at `baseBranch`, merge there, remove the worktree.
+ *   - If `baseBranch` IS currently checked out → require a clean tree, hold the
+ *     lock, do the checkout-merge-restore dance, and restore in a finally block.
+ *
+ * Caller must already hold the merge lock.
+ */
+function mergeNoTouch(opts: {
+  repoPath: string;
+  baseBranch: string;
+  branchName: string;
+  mergeMessage: string;
+  log: (line: string) => void;
+}): MergeNoTouchResult {
+  const { repoPath, baseBranch, branchName, mergeMessage, log } = opts;
+
+  // Abort any stale MERGE_HEAD before proceeding (H)
+  abortStaleMergeHead(repoPath, log);
+
+  const currentBranchResult = runGit(["rev-parse", "--abbrev-ref", "HEAD"], {
+    cwd: repoPath,
+    allowFailure: true,
+  });
+  const currentBranch = currentBranchResult.stdout.trim();
+  const baseCheckedOut = currentBranch === baseBranch;
+
+  const mergeArgs = [
+    "-c",
+    "user.name=Shiftboss Runner",
+    "-c",
+    "user.email=runner@local",
+    "merge",
+    branchName,
+    "--no-ff",
+    "-m",
+    mergeMessage,
+  ];
+
+  if (!baseCheckedOut) {
+    // Preferred path: merge in a fresh detached worktree — user's checkout untouched.
+    // Capture the base SHA now so the final ref update can be a compare-and-swap:
+    // if anything else moves the base ref while we merge (e.g. a stolen lock),
+    // update-ref fails instead of silently clobbering the other merge.
+    const baseShaBefore = runGit(["rev-parse", `refs/heads/${baseBranch}`], {
+      cwd: repoPath,
+      allowFailure: true,
+    }).stdout.trim();
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "shiftboss-merge-"));
+    const tmpWtPath = path.join(tmpDir, "wt");
+    try {
+      const addWt = runGit(
+        ["worktree", "add", "--detach", tmpWtPath, baseBranch],
+        { cwd: repoPath, allowFailure: true, log }
+      );
+      if (addWt.status !== 0) {
+        // Fall through to checkout dance below if worktree add fails; clean up tmpDir first.
+        log(`Warning: temp worktree add failed (${addWt.stderr.trim()}); falling back to checkout merge.`);
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      } else {
+        try {
+          const mergeResult = runGit(mergeArgs, { cwd: tmpWtPath, allowFailure: true, log });
+          if (mergeResult.status !== 0) {
+            const conflictFiles = listUnmergedFiles(tmpWtPath);
+            runGit(["merge", "--abort"], { cwd: tmpWtPath, allowFailure: true, log });
+            return {
+              ok: false,
+              error: mergeResult.stderr.trim() || mergeResult.stdout.trim() || `merge into ${baseBranch} failed`,
+              isConflict: conflictFiles.length > 0,
+              conflictFiles,
+            };
+          }
+          // Push the merge commit from the temp worktree's HEAD back to the branch ref.
+          // git update-ref is the safest: no checkout required in the main repo.
+          const newSha = runGit(["rev-parse", "HEAD"], {
+            cwd: tmpWtPath,
+            allowFailure: true,
+          }).stdout.trim();
+          if (!newSha) {
+            return {
+              ok: false,
+              error: "failed to read merge commit SHA from temp worktree",
+              isConflict: false,
+              conflictFiles: [],
+            };
+          }
+          const updateRef = runGit(
+            baseShaBefore
+              ? ["update-ref", `refs/heads/${baseBranch}`, newSha, baseShaBefore]
+              : ["update-ref", `refs/heads/${baseBranch}`, newSha],
+            { cwd: repoPath, allowFailure: true, log }
+          );
+          if (updateRef.status !== 0) {
+            return {
+              ok: false,
+              error: updateRef.stderr.trim() || "git update-ref failed",
+              isConflict: false,
+              conflictFiles: [],
+            };
+          }
+          return { ok: true };
+        } finally {
+          runGit(["worktree", "remove", "--force", tmpWtPath], {
+            cwd: repoPath,
+            allowFailure: true,
+          });
+          try {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+          } catch { /* ignore */ }
+        }
+      }
+    } catch (err) {
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch { /* ignore */ }
+      log(`Warning: temp worktree approach failed: ${String(err)}; falling back to checkout merge.`);
+    }
+  }
+
+  // Fallback / base-is-checked-out path: explicit checkout-merge-restore.
+  // Main repo must be clean before we switch branches.
+  const statusResult = runGit(["status", "--porcelain"], { cwd: repoPath, allowFailure: true });
+  if (statusResult.stdout.trim()) {
+    return {
+      ok: false,
+      error: "main repo has uncommitted changes; cannot merge",
+      isConflict: false,
+      conflictFiles: [],
+    };
+  }
+
+  const priorBranch = currentBranch && currentBranch !== "HEAD" ? currentBranch : null;
+  let checkedOut = false;
+  try {
+    runGit(["checkout", baseBranch], { cwd: repoPath, log });
+    checkedOut = true;
+
+    const mergeResult = runGit(mergeArgs, { cwd: repoPath, allowFailure: true, log });
+    if (mergeResult.status !== 0) {
+      const conflictFiles = listUnmergedFiles(repoPath);
+      runGit(["merge", "--abort"], { cwd: repoPath, allowFailure: true, log });
+      return {
+        ok: false,
+        error: mergeResult.stderr.trim() || mergeResult.stdout.trim() || `merge into ${baseBranch} failed`,
+        isConflict: conflictFiles.length > 0,
+        conflictFiles,
+      };
+    }
+    return { ok: true };
+  } finally {
+    if (checkedOut && priorBranch && priorBranch !== baseBranch) {
+      runGit(["checkout", priorBranch], { cwd: repoPath, allowFailure: true, log });
+    }
+  }
+}
+
 export async function cancelRun(runId: string): Promise<CancelRunResult> {
   const run = getRunById(runId);
   if (!run) return { ok: false, error: "run not found", code: "not_found" };
@@ -5756,9 +6096,16 @@ export function approveRunMerge(runId: string): ApproveRunMergeResult {
   const log = (line: string) => appendLog(run.log_path, line);
   const { worktreePath, worktreeRealPath } = resolveWorktreePaths(run.run_dir);
   const repoPath = project.path;
-  const baseBranch = resolveBaseBranch(repoPath, log, {
-    runSourceBranch: run.source_branch,
-  });
+
+  // C: load WO to get woBaseBranch so base resolves correctly even when
+  // run.source_branch is null (autopilot runs)
+  let woBaseBranch: string | null = null;
+  try {
+    const wo = getWorkOrder(repoPath, run.work_order_id);
+    woBaseBranch = wo.base_branch;
+  } catch {
+    // WO may not be readable; fall through
+  }
 
   const currentProjectId = getRunById(runId)?.project_id ?? run.project_id;
   if (!acquireMergeLock(currentProjectId, runId)) {
@@ -5769,62 +6116,45 @@ export function approveRunMerge(runId: string): ApproveRunMergeResult {
     };
   }
 
-  const ensureCleanMainRepo = (): boolean => {
-    const status = runGit(["status", "--porcelain"], {
-      cwd: repoPath,
-      allowFailure: true,
-    });
-    if (!status.stdout.trim()) return true;
-    log("Main repo has uncommitted changes; refusing merge.");
-    return false;
-  };
-
   try {
-    if (!ensureCleanMainRepo()) {
-      return {
-        ok: false,
-        error: "main branch has uncommitted changes; merge aborted",
-        code: "merge_failed",
-      };
-    }
+    // H: abort any stale in-progress merge before we start
+    abortStaleMergeHead(repoPath, log);
 
-    runGit(["checkout", baseBranch], { cwd: repoPath, log });
+    // B: resolve base AFTER acquiring lock so concurrent merges that landed
+    // during the wait are accounted for
+    const baseBranch = resolveBaseBranch(repoPath, log, {
+      runSourceBranch: run.source_branch,
+      woBaseBranch,
+    });
+
     updateRun(runId, { merge_status: "pending", pr_url: null });
 
     const mergeTitle = run.work_order_id.replace(/\s+/g, " ").trim();
-    const mergeResult = runGit(
-      [
-        "-c",
-        "user.name=Shiftboss Runner",
-        "-c",
-        "user.email=runner@local",
-        "merge",
-        branchName,
-        "--no-ff",
-        "-m",
-        `Merge ${mergeTitle}: manual approval`,
-      ],
-      { cwd: repoPath, allowFailure: true, log }
-    );
+    // D: use mergeNoTouch so we never modify the user's working copy
+    const mergeResult = mergeNoTouch({
+      repoPath,
+      baseBranch,
+      branchName,
+      mergeMessage: `Merge ${mergeTitle}: manual approval`,
+      log,
+    });
 
-    if (mergeResult.status !== 0) {
-      const conflictFiles = listUnmergedFiles(repoPath);
-      runGit(["merge", "--abort"], { cwd: repoPath, allowFailure: true, log });
-      const message =
-        mergeResult.stderr.trim() ||
-        mergeResult.stdout.trim() ||
-        `merge to ${baseBranch} failed`;
+    if (!mergeResult.ok) {
       updateRun(runId, {
         status: "merge_conflict",
         merge_status: "conflict",
         conflict_with_run_id: null,
-        error: message,
+        error: mergeResult.error,
         finished_at: nowIso(),
       });
-      if (conflictFiles.length) {
-        writeJson(path.join(run.run_dir, "conflict_files.json"), conflictFiles);
+      if (mergeResult.conflictFiles.length) {
+        writeJson(path.join(run.run_dir, "conflict_files.json"), mergeResult.conflictFiles);
       }
-      return { ok: false, error: message, code: "merge_conflict" };
+      return {
+        ok: false,
+        error: mergeResult.error,
+        code: mergeResult.isConflict ? "merge_conflict" : "merge_failed",
+      };
     }
 
     cleanupWorktree({
@@ -6143,23 +6473,46 @@ export function finalizeManualRunResolution(
 
   const runDir = run.run_dir;
   const { worktreePath, worktreeRealPath } = resolveWorktreePaths(runDir);
-  const log = (line: string) => appendLog(path.join(runDir, "run.log"), line);
+  const log = (line: string) => appendLog(run.log_path, line);
+
+  // C: load WO to get woBaseBranch for correct base resolution
+  let woBaseBranch: string | null = null;
+  try {
+    const wo = getWorkOrder(repoPath, run.work_order_id);
+    woBaseBranch = wo.base_branch;
+  } catch {
+    // WO may not be readable; fall through
+  }
+
+  const currentProjectId = getRunById(runId)?.project_id ?? run.project_id;
+  if (!acquireMergeLock(currentProjectId, runId)) {
+    return { ok: false, error: "Merge lock is currently held by another run" };
+  }
 
   try {
+    // H: abort any stale in-progress merge before we start
+    abortStaleMergeHead(repoPath, log);
+
+    // B+C: resolve base AFTER acquiring lock; use WO base_branch for correctness
     const baseBranch = resolveBaseBranch(repoPath, log, {
       runSourceBranch: run.source_branch,
+      woBaseBranch,
     });
 
     // Attempt merge after manual resolution
-    log("Attempting merge after manual resolution");
-    const mergeResult = runGit(
-      ["merge", branchName, "--no-ff", "-m", `Merge ${run.work_order_id}: manual resolution`],
-      { cwd: repoPath, allowFailure: true, log }
-    );
+    log(`Attempting merge after manual resolution into ${baseBranch}`);
+    // D: use mergeNoTouch so we never modify the user's working copy unexpectedly
+    const mergeResult = mergeNoTouch({
+      repoPath,
+      baseBranch,
+      branchName,
+      mergeMessage: `Merge ${run.work_order_id}: manual resolution`,
+      log,
+    });
 
-    if (mergeResult.status !== 0) {
-      log(`Merge still failing: ${mergeResult.stderr}`);
-      return { ok: false, error: "Merge still has conflicts" };
+    if (!mergeResult.ok) {
+      log(`Merge still failing: ${mergeResult.error}`);
+      return { ok: false, error: mergeResult.error };
     }
 
     // Success - update status and cleanup
@@ -6183,10 +6536,17 @@ export function finalizeManualRunResolution(
     const msg = err instanceof Error ? err.message : String(err);
     log(`Manual resolution failed: ${msg}`);
     return { ok: false, error: msg };
+  } finally {
+    try {
+      releaseMergeLock(currentProjectId, runId);
+    } catch (err) {
+      log(`Merge lock release failed: ${String(err)}`);
+    }
   }
 }
 
 export const __test__ = {
+  abortStaleMergeHead,
   applyMergePolicyAfterApproval,
   autoCommitDirtyWorkOrdersBeforeRun,
   buildConflictContext,
@@ -6198,6 +6558,7 @@ export const __test__ = {
   isRunWorkerAlive,
   killTargetForPid,
   mergeContextFiles,
+  mergeNoTouch,
   parseProjectBuilderEnv,
   parsePullRequestUrl,
   readRunnerPid,
@@ -6206,5 +6567,6 @@ export const __test__ = {
   resolveResumeSkips,
   resolveWorktreePaths,
   resolveBaseBranch,
+  stageSafeChanges,
   writeRunnerPid,
 };

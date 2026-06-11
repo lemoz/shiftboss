@@ -561,6 +561,7 @@ export type MergeLockRow = {
   project_id: string;
   run_id: string;
   acquired_at: string;
+  heartbeat_at: string | null;
 };
 
 export type CostCategory = "builder" | "reviewer" | "chat" | "handoff" | "other";
@@ -1393,6 +1394,7 @@ function initSchema(database: Database.Database) {
       project_id TEXT PRIMARY KEY,
       run_id TEXT NOT NULL,
       acquired_at TEXT NOT NULL,
+      heartbeat_at TEXT,
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
     );
 
@@ -2656,6 +2658,15 @@ function initSchema(database: Database.Database) {
       PRIMARY KEY (project_id, year, seq)
     );
   `);
+
+  // merge_locks heartbeat_at migration
+  const mergeLockColumns = database
+    .prepare("PRAGMA table_info(merge_locks)")
+    .all() as Array<{ name: string }>;
+  const hasHeartbeatAt = mergeLockColumns.some((c) => c.name === "heartbeat_at");
+  if (!hasHeartbeatAt && mergeLockColumns.length > 0) {
+    database.exec("ALTER TABLE merge_locks ADD COLUMN heartbeat_at TEXT;");
+  }
 }
 
 export function listProjects(): ProjectRow[] {
@@ -4903,24 +4914,57 @@ export function listRunsByProject(projectId: string, limit = 50): RunRow[] {
 }
 
 const MERGE_LOCK_TTL_MS = 10 * 60 * 1000;
+// Heartbeat: holder refreshes every 60s; stealing allowed only after 3 missed beats.
+export const MERGE_LOCK_HEARTBEAT_INTERVAL_MS = 60 * 1000;
+const MERGE_LOCK_HEARTBEAT_STALE_MS = 3 * MERGE_LOCK_HEARTBEAT_INTERVAL_MS;
+
+/**
+ * Returns true when a lock row's heartbeat is stale enough that the holder can
+ * be considered dead.  A row with no heartbeat_at falls back to the original
+ * 10-minute TTL so old rows are still reaped on upgrade.
+ */
+function isMergeLockStale(row: MergeLockRow, now: Date): boolean {
+  if (row.heartbeat_at) {
+    return now.getTime() - new Date(row.heartbeat_at).getTime() > MERGE_LOCK_HEARTBEAT_STALE_MS;
+  }
+  // No heartbeat recorded yet — use original TTL as fallback
+  return now.getTime() - new Date(row.acquired_at).getTime() > MERGE_LOCK_TTL_MS;
+}
 
 export function acquireMergeLock(projectId: string, runId: string): boolean {
   const database = getDb();
   const now = new Date();
-  const cutoff = new Date(now.getTime() - MERGE_LOCK_TTL_MS).toISOString();
-  database.prepare("DELETE FROM merge_locks WHERE acquired_at < ?").run(cutoff);
 
-  const insert = database
-    .prepare(
-      "INSERT OR IGNORE INTO merge_locks (project_id, run_id, acquired_at) VALUES (?, ?, ?)"
-    )
-    .run(projectId, runId, now.toISOString());
-  if (insert.changes > 0) return true;
-
+  // Reap any lock whose heartbeat (or acquired_at for old rows) is stale.
   const existing = database
     .prepare("SELECT * FROM merge_locks WHERE project_id = ?")
     .get(projectId) as MergeLockRow | undefined;
-  return existing?.run_id === runId;
+  if (existing && existing.run_id !== runId && isMergeLockStale(existing, now)) {
+    database
+      .prepare("DELETE FROM merge_locks WHERE project_id = ? AND run_id = ?")
+      .run(projectId, existing.run_id);
+  }
+
+  const insert = database
+    .prepare(
+      "INSERT OR IGNORE INTO merge_locks (project_id, run_id, acquired_at, heartbeat_at) VALUES (?, ?, ?, ?)"
+    )
+    .run(projectId, runId, now.toISOString(), now.toISOString());
+  if (insert.changes > 0) return true;
+
+  const current = database
+    .prepare("SELECT * FROM merge_locks WHERE project_id = ?")
+    .get(projectId) as MergeLockRow | undefined;
+  return current?.run_id === runId;
+}
+
+export function refreshMergeLockHeartbeat(projectId: string, runId: string): void {
+  const database = getDb();
+  database
+    .prepare(
+      "UPDATE merge_locks SET heartbeat_at = ? WHERE project_id = ? AND run_id = ?"
+    )
+    .run(new Date().toISOString(), projectId, runId);
 }
 
 export function releaseMergeLock(projectId: string, runId: string): void {
