@@ -3,7 +3,14 @@ import fs from "fs";
 import path from "path";
 import YAML from "yaml";
 import { z } from "zod";
-import { findProjectByPath, getDb, syncWorkOrderDeps } from "./db.js";
+import {
+  claimWorkOrderSequence,
+  deleteWorkOrderRow,
+  findProjectByPath,
+  getDb,
+  releaseWorkOrderSequence,
+  syncWorkOrderDeps,
+} from "./db.js";
 import { slugify } from "./utils.js";
 
 export const WORK_ORDER_STATUSES = [
@@ -150,6 +157,25 @@ function workOrdersDir(repoPath: string): string {
 function ensureDir(dir: string) {
   if (fs.existsSync(dir)) return;
   fs.mkdirSync(dir, { recursive: true });
+}
+
+/**
+ * Atomically write `content` to `filePath` using a write-temp-then-rename
+ * strategy so readers always see either the old or the new file, never a torn
+ * (truncated/partial) file.  The temp file is placed in the same directory so
+ * that fs.renameSync is guaranteed to be an atomic same-filesystem rename.
+ */
+function writeFileAtomic(filePath: string, content: string): void {
+  const dir = path.dirname(filePath);
+  const tmpPath = path.join(dir, `.${path.basename(filePath)}.tmp.${process.pid}`);
+  try {
+    fs.writeFileSync(tmpPath, content, "utf8");
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    // Best-effort cleanup of the temp file; ignore secondary errors.
+    try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    throw err;
+  }
 }
 
 type ParsedFile = {
@@ -651,11 +677,14 @@ function nextSequence(repoPath: string, year: number): number {
   const dir = workOrdersDir(repoPath);
   if (!fs.existsSync(dir)) return 1;
 
-  const re = /^WO-(\d{4})-(\d{3})/;
+  // Fast-path: match standard filename prefix WO-YYYY-NNN
+  const reFilename = /^WO-(\d{4})-(\d{3})/;
+  // Frontmatter fallback: match `id: WO-YYYY-NNN` anywhere in the YAML block
+  const reFrontmatter = /^id:\s*["']?WO-(\d{4})-(\d{3})/m;
   let max = 0;
 
   for (const fileName of safeListDir(dir)) {
-    const match = fileName.match(re);
+    const match = fileName.match(reFilename);
     if (match && Number(match[1]) === year) {
       const n = Number(match[2]);
       if (Number.isFinite(n)) max = Math.max(max, n);
@@ -672,7 +701,7 @@ function nextSequence(repoPath: string, year: number): number {
     }
     const parts = splitFrontmatter(contents);
     if (!parts) continue;
-    const match2 = parts.yaml.match(re);
+    const match2 = parts.yaml.match(reFrontmatter);
     if (match2 && Number(match2[1]) === year) {
       const n = Number(match2[2]);
       if (Number.isFinite(n)) max = Math.max(max, n);
@@ -695,17 +724,27 @@ export function createWorkOrder(
 
   const now = todayIsoDate();
   const year = new Date().getFullYear();
-  let seq = nextSequence(repoPath, year);
   const title = input.title.trim();
   const slug = slugify(title) || "work-order";
 
+  // Allocate a collision-free sequence number.  The directory scan gives us a
+  // floor; the DB claim makes the allocation atomic across concurrent processes
+  // (e.g. two runner workers creating scope-creep drafts in parallel worktrees).
+  const project = findProjectByPath(repoPath);
+  const dirFloor = nextSequence(repoPath, year) - 1; // nextSequence returns max+1
+  let seq = claimWorkOrderSequence(project?.id ?? null, year, dirFloor);
+
   let id: string;
   let filePath: string;
+  // Still do the existsSync loop for the rare case where files were created
+  // outside of Shiftboss and haven't been claimed in the DB yet.
   while (true) {
     id = `WO-${year}-${String(seq).padStart(3, "0")}`;
     filePath = path.join(dir, `${id}-${slug}.md`);
     if (!fs.existsSync(filePath)) break;
-    seq += 1;
+    // File already exists; release this claim and grab the next one.
+    if (project) releaseWorkOrderSequence(project.id, year, seq);
+    seq = claimWorkOrderSequence(project?.id ?? null, year, seq);
   }
 
   const priority =
@@ -746,7 +785,7 @@ export function createWorkOrder(
   const body = `\n\n## Notes\n- \n`;
 
   try {
-    fs.writeFileSync(filePath, serializeWorkOrderFile(frontmatter, body), "utf8");
+    writeFileAtomic(filePath, serializeWorkOrderFile(frontmatter, body));
   } catch (err) {
     throw new WorkOrderError("Failed to write Work Order file", "io", {
       error: String(err),
@@ -757,7 +796,6 @@ export function createWorkOrder(
   if (!normalized) {
     throw new WorkOrderError("Failed to normalize created Work Order", "invalid");
   }
-  const project = findProjectByPath(repoPath);
   if (project) {
     syncWorkOrderRows(project.id, [normalized]);
     syncWorkOrderDeps(project.id, normalized.id, normalized.depends_on);
@@ -934,11 +972,7 @@ export function patchWorkOrder(
   }
 
   try {
-    fs.writeFileSync(
-      filePath,
-      serializeWorkOrderFile(frontmatter, parsed.body),
-      "utf8"
-    );
+    writeFileAtomic(filePath, serializeWorkOrderFile(frontmatter, parsed.body));
   } catch (err) {
     throw new WorkOrderError("Failed to write Work Order file", "io", {
       error: String(err),
@@ -953,6 +987,15 @@ export function patchWorkOrder(
   if (project) {
     syncWorkOrderRows(project.id, [normalized]);
     syncWorkOrderDeps(project.id, normalized.id, normalized.depends_on);
+    // Re-attach track info so the PATCH response matches the GET shape.
+    const trackInfo = loadWorkOrderTrackInfo(project.id, [normalized.id]);
+    const info = trackInfo.get(normalized.id);
+    if (info) {
+      normalized.trackId = info.trackId;
+      normalized.track = info.track;
+      normalized.trackIds = info.trackIds;
+      normalized.tracks = info.tracks;
+    }
   }
 
   // Auto-commit WO file changes to keep main clean for merges
@@ -1055,6 +1098,11 @@ export function deleteWorkOrder(repoPath: string, id: string): void {
       error: String(err),
     });
   }
+  // Remove the DB row so ghost rows don't feed counts and dependency checks.
+  const project = findProjectByPath(repoPath);
+  if (project) {
+    deleteWorkOrderRow(project.id, id);
+  }
 }
 
 export function overwriteWorkOrderMarkdown(
@@ -1082,7 +1130,7 @@ export function overwriteWorkOrderMarkdown(
   }
 
   try {
-    fs.writeFileSync(filePath, markdown, "utf8");
+    writeFileAtomic(filePath, markdown);
   } catch (err) {
     throw new WorkOrderError("Failed to write Work Order file", "io", {
       error: String(err),
