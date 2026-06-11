@@ -74,7 +74,7 @@ export type ShiftSchedulerSettings = {
   quiet_hours_end: string;
 };
 
-export type AgentType = "builder" | "reviewer" | "shift_agent" | "global_agent";
+export type AgentType = "builder" | "reviewer" | "shift_agent" | "global_agent" | "chat_agent";
 
 export type AgentMonitoringSettings = {
   builder: {
@@ -94,6 +94,10 @@ export type AgentMonitoringSettings = {
   };
   global_agent: {
     networkAccess: "full";
+    monitorEnabled: boolean;
+    autoKillOnThreat: boolean;
+  };
+  chat_agent: {
     monitorEnabled: boolean;
     autoKillOnThreat: boolean;
   };
@@ -190,11 +194,17 @@ const ShiftMonitoringSchema = z.object({
   autoKillOnThreat: z.boolean().default(true),
 });
 
+const ChatMonitoringSchema = z.object({
+  monitorEnabled: z.boolean().default(true),
+  autoKillOnThreat: z.boolean().default(true),
+});
+
 const AgentMonitoringSettingsSchema = z.object({
   builder: BuilderMonitoringSchema,
   reviewer: ReviewerMonitoringSchema,
   shift_agent: ShiftMonitoringSchema,
   global_agent: ShiftMonitoringSchema,
+  chat_agent: ChatMonitoringSchema,
 });
 
 const RunnerSettingsPatchSchema = z
@@ -212,6 +222,7 @@ const AgentMonitoringSettingsPatchSchema = z
     reviewer: ReviewerMonitoringSchema.partial().optional(),
     shift_agent: ShiftMonitoringSchema.partial().optional(),
     global_agent: ShiftMonitoringSchema.partial().optional(),
+    chat_agent: ChatMonitoringSchema.partial().optional(),
   })
   .strict();
 
@@ -307,6 +318,10 @@ function monitoringDefaults(): AgentMonitoringSettings {
       monitorEnabled: true,
       autoKillOnThreat: true,
     },
+    chat_agent: {
+      monitorEnabled: true,
+      autoKillOnThreat: true,
+    },
   };
 }
 
@@ -393,6 +408,7 @@ function mergeMonitoringSettings(
     reviewer: { ...base.reviewer, ...(patch.reviewer || {}) },
     shift_agent: { ...base.shift_agent, ...(patch.shift_agent || {}) },
     global_agent: { ...base.global_agent, ...(patch.global_agent || {}) },
+    chat_agent: { ...base.chat_agent, ...(patch.chat_agent || {}) },
   };
 }
 
@@ -461,6 +477,10 @@ function loadSavedAgentMonitoringSettings(): AgentMonitoringSettings {
       monitorEnabled: row.global_agent_monitor_enabled === 1,
       autoKillOnThreat: row.global_agent_auto_kill_on_threat === 1,
     },
+    chat_agent: {
+      monitorEnabled: (row.chat_agent_monitor_enabled ?? 1) === 1,
+      autoKillOnThreat: (row.chat_agent_auto_kill_on_threat ?? 1) === 1,
+    },
   });
 }
 
@@ -509,6 +529,8 @@ function saveAgentMonitoringSettings(
     global_agent_network_access: normalized.global_agent.networkAccess,
     global_agent_monitor_enabled: normalized.global_agent.monitorEnabled ? 1 : 0,
     global_agent_auto_kill_on_threat: normalized.global_agent.autoKillOnThreat ? 1 : 0,
+    chat_agent_monitor_enabled: normalized.chat_agent.monitorEnabled ? 1 : 0,
+    chat_agent_auto_kill_on_threat: normalized.chat_agent.autoKillOnThreat ? 1 : 0,
   });
   return normalized;
 }
@@ -750,9 +772,9 @@ export function patchAgentMonitoringSettings(input: unknown): AgentMonitoringSet
   return saveAgentMonitoringSettings(merged);
 }
 
-export function getMonitoringSettings(
-  agentType: AgentType
-): AgentMonitoringSettings[AgentType] {
+export function getMonitoringSettings<T extends AgentType>(
+  agentType: T
+): AgentMonitoringSettings[T] {
   const settings = loadSavedAgentMonitoringSettings();
   return settings[agentType];
 }

@@ -14,7 +14,6 @@ services:
       SHIFTBOSS_SCAN_ROOTS: /repos
     volumes:
       - ./:/repos/pcc
-      - /var/run/docker.sock:/var/run/docker.sock
       - ${HOME}/.codex:/root/.codex
 
   ui:

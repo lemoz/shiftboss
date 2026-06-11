@@ -1,5 +1,7 @@
 import { spawnSync } from "child_process";
 import { executeAgentCli } from "./agent_execution.js";
+import { StreamMonitor, type StreamMonitorContext } from "./stream_monitor.js";
+import { getMonitoringSettings } from "./settings.js";
 import fs from "fs";
 import path from "path";
 import {
@@ -360,6 +362,17 @@ async function decideWithClaude(options: {
   // kill, SIGCONT-before-SIGTERM, and deadlock-free timeout machinery are all
   // in one place.  The logStream is written via onCost (which fires after all
   // output is captured) so we preserve the existing log-file behaviour.
+  const globalMonitoring = getMonitoringSettings("global_agent");
+  const monitor = globalMonitoring.monitorEnabled
+    ? new StreamMonitor({
+        log: options.onLog,
+        autoKillOnThreat: globalMonitoring.autoKillOnThreat,
+      })
+    : undefined;
+  const monitorContext: StreamMonitorContext = {
+    goal: "global agent decision",
+    acceptanceCriteria: [],
+  };
   const result = await executeAgentCli({
     command,
     args,
@@ -367,6 +380,8 @@ async function decideWithClaude(options: {
     timeoutMs,
     label: "decideWithClaude",
     log: options.onLog,
+    streamMonitor: monitor,
+    streamContext: monitor ? monitorContext : undefined,
     onCost: (info) => {
       if (logStream) {
         logStream.write(info.stdout);

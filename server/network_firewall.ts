@@ -26,7 +26,6 @@ type FirewallOptions = {
   runId: string;
   log?: (line: string) => void;
   onViolation?: ViolationCallback;
-  containerMode?: boolean;
   extraAllowHosts?: string[];
   restrictUid?: number;
   proxyOnly?: boolean;
@@ -36,7 +35,6 @@ type FirewallBackend = {
   allowAddresses: (addresses: dns.LookupAddress[]) => void;
   allowLoopbackTcpPorts?: (ports: number[]) => void;
   stop: () => Promise<void>;
-  enableContainerRules?: () => boolean;
 };
 
 type FirewallLogMonitor = {
@@ -54,7 +52,6 @@ type ActiveFirewall = {
   refCount: number;
   callbacks: Set<ViolationCallback>;
   hostAddresses: Map<string, dns.LookupAddress[]>;
-  containerEnabled: boolean;
   proxyOnly: boolean;
   restrictUid?: number;
 };
@@ -64,7 +61,6 @@ let stubFirewallState: {
   guardId: string;
   allowed: dns.LookupAddress[];
   loopbackTcpPorts: number[];
-  containerEnabled: boolean;
   stopped: boolean;
 } | null = null;
 
@@ -426,14 +422,12 @@ function startIptablesGuard(
     log?: (line: string) => void;
     onViolation?: ViolationCallback;
     restrictUid?: number;
-    skipOutput?: boolean;
     allowLoopback?: boolean;
   }
 ): FirewallBackend {
   const log = options?.log;
   const onViolation = options?.onViolation;
   const restrictUid = options?.restrictUid;
-  const skipOutput = options?.skipOutput ?? false;
   const allowLoopback = options?.allowLoopback ?? true;
   const allowInsertIndex = allowLoopback ? 3 : 2;
   const chain = `PCCWL${guardId.toUpperCase()}`;
@@ -442,8 +436,6 @@ function startIptablesGuard(
   const allowedV6 = new Set<string>();
   const allowedLoopbackPorts = new Set<number>();
   let logMonitor: FirewallLogMonitor | null = null;
-  let dockerUserHooked = false;
-  let dockerUser6Hooked = false;
 
   const hasIp6 = (() => {
     const res = spawnSync("ip6tables", ["-L"], {
@@ -461,56 +453,13 @@ function startIptablesGuard(
 
   const cleanup = () => {
     execCommand("iptables", outputDeleteArgs, { log, allowFailure: true });
-    if (dockerUserHooked) {
-      execCommand("iptables", ["-D", "DOCKER-USER", "-j", chain], {
-        log,
-        allowFailure: true,
-      });
-    }
     execCommand("iptables", ["-F", chain], { log, allowFailure: true });
     execCommand("iptables", ["-X", chain], { log, allowFailure: true });
     if (hasIp6) {
       execCommand("ip6tables", outputDeleteArgs, { log, allowFailure: true });
-      if (dockerUser6Hooked) {
-        execCommand("ip6tables", ["-D", "DOCKER-USER", "-j", chain], {
-          log,
-          allowFailure: true,
-        });
-      }
       execCommand("ip6tables", ["-F", chain], { log, allowFailure: true });
       execCommand("ip6tables", ["-X", chain], { log, allowFailure: true });
     }
-  };
-
-  const enableContainerRules = (): boolean => {
-    if (dockerUserHooked || dockerUser6Hooked) return true;
-    if (!chainExists("iptables", "DOCKER-USER")) {
-      log?.(
-        "[network-firewall] DOCKER-USER chain unavailable; container egress not restricted."
-      );
-      return false;
-    }
-    execCommand("iptables", ["-D", "DOCKER-USER", "-j", chain], {
-      log,
-      allowFailure: true,
-    });
-    execCommand("iptables", ["-I", "DOCKER-USER", "1", "-j", chain], { log });
-    dockerUserHooked = true;
-    if (hasIp6) {
-      if (chainExists("ip6tables", "DOCKER-USER")) {
-        execCommand("ip6tables", ["-D", "DOCKER-USER", "-j", chain], {
-          log,
-          allowFailure: true,
-        });
-        execCommand("ip6tables", ["-I", "DOCKER-USER", "1", "-j", chain], { log });
-        dockerUser6Hooked = true;
-      } else {
-        log?.(
-          "[network-firewall] ip6tables DOCKER-USER chain unavailable; IPv6 container egress not restricted."
-        );
-      }
-    }
-    return true;
   };
 
   try {
@@ -518,9 +467,7 @@ function startIptablesGuard(
     execCommand("iptables", ["-F", chain], { log, allowFailure: true });
     execCommand("iptables", ["-X", chain], { log, allowFailure: true });
     execCommand("iptables", ["-N", chain], { log });
-    if (!skipOutput) {
-      execCommand("iptables", outputInsertArgs, { log });
-    }
+    execCommand("iptables", outputInsertArgs, { log });
     if (allowLoopback) {
       execCommand("iptables", ["-A", chain, "-o", "lo", "-j", "RETURN"], { log });
     }
@@ -558,9 +505,7 @@ function startIptablesGuard(
       execCommand("ip6tables", ["-F", chain], { log, allowFailure: true });
       execCommand("ip6tables", ["-X", chain], { log, allowFailure: true });
       execCommand("ip6tables", ["-N", chain], { log });
-      if (!skipOutput) {
-        execCommand("ip6tables", outputInsertArgs, { log });
-      }
+      execCommand("ip6tables", outputInsertArgs, { log });
       if (allowLoopback) {
         execCommand("ip6tables", ["-A", chain, "-o", "lo", "-j", "RETURN"], { log });
       }
@@ -655,7 +600,7 @@ function startIptablesGuard(
     cleanup();
   };
 
-  return { allowAddresses, allowLoopbackTcpPorts, stop, enableContainerRules };
+  return { allowAddresses, allowLoopbackTcpPorts, stop };
 }
 
 function startPfGuard(
@@ -772,7 +717,6 @@ function startStubGuard(
     guardId,
     allowed: [],
     loopbackTcpPorts: [],
-    containerEnabled: false,
     stopped: false,
   };
   options?.log?.("[network-firewall] stub backend active; enforcement disabled.");
@@ -795,12 +739,7 @@ function startStubGuard(
     }
   };
 
-  const enableContainerRules = () => {
-    if (stubFirewallState) stubFirewallState.containerEnabled = true;
-    return true;
-  };
-
-  return { allowAddresses, allowLoopbackTcpPorts, stop, enableContainerRules };
+  return { allowAddresses, allowLoopbackTcpPorts, stop };
 }
 
 async function releaseFirewall(
@@ -824,14 +763,11 @@ export async function startNetworkWhitelistFirewall(
   options: FirewallOptions
 ): Promise<NetworkFirewallHandle | null> {
   const log = options.log;
-  const wantsContainerRules = Boolean(options.containerMode);
   const proxyOnly = Boolean(options.proxyOnly);
   const restrictUid =
     typeof options.restrictUid === "number" ? options.restrictUid : undefined;
   const backendOverride = readFirewallBackendOverride();
   const useStubBackend = backendOverride === "stub";
-  const skipOutput =
-    proxyOnly && restrictUid === undefined && wantsContainerRules && !useStubBackend;
   if (activeFirewall) {
     if (proxyOnly && !activeFirewall.proxyOnly) {
       log?.("[network-firewall] proxy-only guard requested but existing guard allows direct egress.");
@@ -848,17 +784,6 @@ export async function startNetworkWhitelistFirewall(
     if (restrictUid !== undefined && activeFirewall.restrictUid === undefined) {
       log?.("[network-firewall] whitelist guard active without UID restriction.");
       return null;
-    }
-    if (wantsContainerRules && !activeFirewall.containerEnabled) {
-      const enabled = activeFirewall.backend.enableContainerRules?.() ?? false;
-      if (enabled) {
-        activeFirewall.containerEnabled = true;
-      } else {
-        log?.(
-          "[network-firewall] container whitelist enforcement unavailable; refusing to reuse guard."
-        );
-        return null;
-      }
     }
     activeFirewall.refCount += 1;
     if (options.onViolation) activeFirewall.callbacks.add(options.onViolation);
@@ -897,8 +822,12 @@ export async function startNetworkWhitelistFirewall(
   }
 
   if (!useStubBackend && !shouldEnableFirewall(log)) return null;
-  if (proxyOnly && !useStubBackend && restrictUid === undefined && !skipOutput) {
-    log?.("[network-firewall] proxy-only enforcement requires a UID restriction.");
+  // Proxy-only mode requires a UID restriction so the OUTPUT jump is scoped to
+  // the builder process.  Without it the firewall would fail open for all other
+  // processes on the host — fail closed instead.  The stub backend enforces the
+  // same rule so tests exercise the real policy.
+  if (proxyOnly && restrictUid === undefined) {
+    log?.("[network-firewall] proxy-only enforcement requires a UID restriction; refusing to start.");
     return null;
   }
 
@@ -911,13 +840,6 @@ export async function startNetworkWhitelistFirewall(
       if (!canRunCommand("pfctl", ["-s", "info"], log)) return null;
     } else {
       log?.(`[network-firewall] whitelist guard not supported on ${platform}.`);
-      return null;
-    }
-
-    if (wantsContainerRules && platform !== "linux") {
-      log?.(
-        `[network-firewall] container whitelist enforcement unsupported on ${platform}.`
-      );
       return null;
     }
   }
@@ -951,7 +873,6 @@ export async function startNetworkWhitelistFirewall(
         log,
         onViolation: reportViolation,
         restrictUid,
-        skipOutput,
         allowLoopback: !proxyOnly,
       });
     } else {
@@ -974,22 +895,6 @@ export async function startNetworkWhitelistFirewall(
     backend.allowAddresses(extraAllowed);
   }
 
-  const containerEnabled = wantsContainerRules
-    ? backend.enableContainerRules?.() ?? false
-    : false;
-
-  if (wantsContainerRules && !containerEnabled) {
-    log?.(
-      "[network-firewall] container whitelist enforcement unavailable; guard aborted."
-    );
-    await backend.stop();
-    return null;
-  }
-
-  if (skipOutput) {
-    log?.("[network-firewall] host OUTPUT filtering disabled; container-only enforcement active.");
-  }
-
   const platformLabel = useStubBackend ? "stub" : platform;
   log?.(
     `[network-firewall] whitelist guard enabled (${platformLabel}) id=${guardId} addresses=${resolved.addresses.length} dns=blocked`
@@ -1007,7 +912,6 @@ export async function startNetworkWhitelistFirewall(
     refCount: 1,
     callbacks,
     hostAddresses: resolved.byHost,
-    containerEnabled,
     proxyOnly,
     restrictUid,
   };

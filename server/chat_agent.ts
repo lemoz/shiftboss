@@ -52,7 +52,8 @@ import {
   type ChatConfirmations,
 } from "./chat_contract.js";
 import { listWorkOrders, type WorkOrder } from "./work_orders.js";
-import { resolveChatSettings } from "./settings.js";
+import { resolveChatSettings, getMonitoringSettings } from "./settings.js";
+import { StreamMonitor, type StreamMonitorContext } from "./stream_monitor.js";
 import { ensurePortfolioWorkspace } from "./portfolio_workspace.js";
 import { ensureChatWorktree, readWorktreeStatus } from "./chat_worktree.js";
 import {
@@ -535,6 +536,8 @@ type CodexExecParams = {
   skipGitRepoCheck?: boolean;
   networkEnabled?: boolean;
   onEventJsonLine?: (line: string, control: { abort: (reason: string) => void }) => void;
+  streamMonitor?: StreamMonitor;
+  streamContext?: StreamMonitorContext;
 };
 
 async function runCodexExecJson(params: CodexExecParams): Promise<void> {
@@ -573,6 +576,11 @@ async function runCodexExecJson(params: CodexExecParams): Promise<void> {
     env: { ...getProcessEnv() },
   });
 
+  // Attach stream monitor before any data arrives so no output is missed.
+  if (params.streamMonitor && params.streamContext) {
+    params.streamMonitor.attach(child, params.streamContext);
+  }
+
   let abortReason: string | null = null;
   const abort = (reason: string) => {
     if (abortReason) return;
@@ -605,6 +613,18 @@ async function runCodexExecJson(params: CodexExecParams): Promise<void> {
   const finalLine = stdoutBuf.trimEnd();
   if (finalLine && params.onEventJsonLine) {
     params.onEventJsonLine(finalLine, control);
+  }
+
+  // Detach and flush monitor verdicts before deciding outcome so a late KILL
+  // verdict (Gemini response arrives after process exit) still surfaces.
+  if (params.streamMonitor) {
+    params.streamMonitor.detach();
+    await params.streamMonitor.flush();
+    const incidents = params.streamMonitor.getIncidents();
+    const killIncident = incidents.find((i) => i.action === "killed");
+    if (killIncident && !abortReason) {
+      abortReason = `stream monitor killed run: ${killIncident.reason}`;
+    }
   }
 
   logStream.write(`[${nowIso()}] codex exec end exit=${exitCode}\n`);
@@ -2584,6 +2604,17 @@ export async function runChatRun(runId: string): Promise<void> {
 
   let costRecorded = false;
 
+  const chatMonitoring = getMonitoringSettings("chat_agent");
+  const chatMonitor = chatMonitoring?.monitorEnabled
+    ? new StreamMonitor({ autoKillOnThreat: chatMonitoring.autoKillOnThreat })
+    : undefined;
+  const chatMonitorContext: StreamMonitorContext = {
+    goal: refreshedThread.summary ?? "chat agent run",
+    acceptanceCriteria: [],
+    runId,
+    projectId: refreshedThread.project_id ?? undefined,
+  };
+
   try {
     await runCodexExecJson({
       cwd: runCwd,
@@ -2596,6 +2627,8 @@ export async function runChatRun(runId: string): Promise<void> {
       cliPath: run.cli_path,
       skipGitRepoCheck: skipGitRepoCheck || shouldSkipGitRepoCheck(runCwd),
       networkEnabled: access.network !== "none",
+      streamMonitor: chatMonitor,
+      streamContext: chatMonitor ? chatMonitorContext : undefined,
       onEventJsonLine: (line, control) => {
         let parsed: unknown;
         try {

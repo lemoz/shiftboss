@@ -23,6 +23,10 @@ type AgentMonitoringSettings = {
     monitorEnabled: boolean;
     autoKillOnThreat: boolean;
   };
+  chat_agent: {
+    monitorEnabled: boolean;
+    autoKillOnThreat: boolean;
+  };
 };
 
 type AgentMonitoringSettingsResponse = {
@@ -54,6 +58,10 @@ function emptySettings(): AgentMonitoringSettings {
       monitorEnabled: true,
       autoKillOnThreat: true,
     },
+    chat_agent: {
+      monitorEnabled: true,
+      autoKillOnThreat: true,
+    },
   };
 }
 
@@ -62,6 +70,7 @@ const AGENT_LABELS: Record<AgentKey, string> = {
   reviewer: "Reviewer",
   shift_agent: "Shift agent",
   global_agent: "Global agent",
+  chat_agent: "Chat agent",
 };
 
 export function AgentMonitoringSettingsForm() {
@@ -175,35 +184,50 @@ export function AgentMonitoringSettingsForm() {
             <div key={agent} className="field" style={{ gap: 10 }}>
               <div style={{ fontWeight: 700 }}>{AGENT_LABELS[agent]}</div>
 
-              <div className="field">
-                <div className="fieldLabel muted">Network access</div>
-                {agent === "builder" ? (
-                  <select
-                    className="select"
-                    value={draft.builder.networkAccess}
-                    onChange={(e) =>
-                      updateAgent("builder", {
-                        networkAccess: e.target.value as AgentMonitoringSettings["builder"]["networkAccess"],
-                      })
-                    }
-                  >
-                    <option value="sandboxed">Sandboxed</option>
-                    <option value="whitelist">Whitelist</option>
-                  </select>
-                ) : (
-                  <div className="muted" style={{ fontSize: 13 }}>
-                    {agent === "reviewer" ? "Sandboxed (fixed)" : "Full (fixed)"}
-                  </div>
-                )}
-                {agent === "builder" && (
-                  <div className="muted" style={{ fontSize: 12 }}>
-                    Whitelist uses the domains configured below.
-                  </div>
-                )}
-              </div>
+              {agent !== "chat_agent" && (
+                <div className="field">
+                  <div className="fieldLabel muted">Network access</div>
+                  {agent === "builder" ? (
+                    <select
+                      className="select"
+                      value={draft.builder.networkAccess}
+                      onChange={(e) =>
+                        updateAgent("builder", {
+                          networkAccess: e.target.value as AgentMonitoringSettings["builder"]["networkAccess"],
+                        })
+                      }
+                    >
+                      <option value="sandboxed">Sandboxed</option>
+                      <option value="whitelist">Whitelist</option>
+                    </select>
+                  ) : (
+                    <div className="muted" style={{ fontSize: 13 }}>
+                      {agent === "reviewer" ? "Sandboxed (fixed)" : "Full (fixed)"}
+                    </div>
+                  )}
+                  {agent === "builder" && (
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      Whitelist uses the domains configured below.
+                    </div>
+                  )}
+                  {agent === "shift_agent" && (
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      Shift agents run detached with full network access.
+                      Stream monitoring inspects their stdout in-process;
+                      network egress is not OS-firewall-restricted for shift agents.
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="field">
                 <div className="fieldLabel muted">Monitoring</div>
+                {agent === "chat_agent" && (
+                  <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
+                    Stream monitoring scans chat agent output for credential access,
+                    dangerous commands, and prompt injection.
+                  </div>
+                )}
                 <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
                   <input
                     type="checkbox"
