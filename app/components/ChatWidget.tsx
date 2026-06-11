@@ -156,11 +156,14 @@ export function ChatWidget() {
   const [savingRename, setSavingRename] = useState(false);
   const [archiving, setArchiving] = useState(false);
   const [streamConnected, setStreamConnected] = useState(false);
+  const [streamGeneration, setStreamGeneration] = useState(0);
   const [threadRefreshToken, setThreadRefreshToken] = useState<number | null>(null);
   const hasLoadedThreadsRef = useRef(false);
   const loadingThreadRef = useRef<string | null>(null);
   const streamRefreshTimerRef = useRef<number | null>(null);
   const streamRefreshActiveRef = useRef(false);
+  const streamReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const streamReconnectAttemptsRef = useRef(0);
 
   const derivedScope = useMemo(() => deriveScopeFromPath(pathname), [pathname]);
 
@@ -337,6 +340,11 @@ export function ChatWidget() {
       setStreamConnected(false);
       return;
     }
+    // Clear any pending reconnect timer from a previous generation.
+    if (streamReconnectTimerRef.current !== null) {
+      clearTimeout(streamReconnectTimerRef.current);
+      streamReconnectTimerRef.current = null;
+    }
     const stream = new EventSource("/api/chat/stream");
     const eventTypes = [
       "chat.message.new",
@@ -352,24 +360,40 @@ export function ChatWidget() {
     };
     eventTypes.forEach((type) => stream.addEventListener(type, handleEvent));
     stream.onopen = () => {
+      streamReconnectAttemptsRef.current = 0;
       setStreamConnected(true);
       scheduleStreamRefresh(activeThreadId ?? null);
     };
     stream.onerror = () => {
       setStreamConnected(false);
+      if (stream.readyState === EventSource.CLOSED) {
+        // The browser will not auto-retry a closed stream (e.g. after a 502).
+        // Schedule a reconnect with capped exponential backoff.
+        const attempt = streamReconnectAttemptsRef.current;
+        streamReconnectAttemptsRef.current = attempt + 1;
+        const delayMs = Math.min(30_000, 2_000 * Math.pow(2, attempt));
+        streamReconnectTimerRef.current = setTimeout(() => {
+          streamReconnectTimerRef.current = null;
+          setStreamGeneration((g) => g + 1);
+        }, delayMs);
+      }
     };
 
     return () => {
       eventTypes.forEach((type) => stream.removeEventListener(type, handleEvent));
       stream.close();
       setStreamConnected(false);
+      if (streamReconnectTimerRef.current !== null) {
+        clearTimeout(streamReconnectTimerRef.current);
+        streamReconnectTimerRef.current = null;
+      }
       if (streamRefreshTimerRef.current !== null) {
         window.clearTimeout(streamRefreshTimerRef.current);
         streamRefreshTimerRef.current = null;
         streamRefreshActiveRef.current = false;
       }
     };
-  }, [activeThreadId, chatOpen, scheduleStreamRefresh]);
+  }, [activeThreadId, chatOpen, scheduleStreamRefresh, streamGeneration]);
 
   useEffect(() => {
     if (!chatOpen) return;

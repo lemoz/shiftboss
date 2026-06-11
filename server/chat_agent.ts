@@ -1611,8 +1611,11 @@ export function getChatThreadDetailsById(threadId: string): ChatThreadDetails | 
   const thread = getChatThreadById(threadId);
   if (!thread) return null;
 
-  // Skip summarized messages - they've been rolled into thread.summary
-  const offset = thread.summarized_count;
+  // Skip summarized messages - they've been rolled into thread.summary.
+  // Anchor the window to the tail so new messages are always visible even if
+  // rolling summarization has stalled (summarized_count stops advancing).
+  const total = countChatMessages(thread.id);
+  const offset = Math.max(thread.summarized_count, total - 200);
   const messages = listChatMessages({ threadId: thread.id, limit: 200, order: "asc", offset });
   const runs = listChatRunsForThread(thread.id, 200);
   const runById = new Map(runs.map((r) => [r.id, r]));
@@ -1915,8 +1918,11 @@ export async function suggestChatSettingsForThread(params: {
 
 export function getChatThreadDetails(params: ChatScopeParams): ChatThreadDetails {
   const thread = ensureChatThread(params);
-  // Skip summarized messages - they've been rolled into thread.summary
-  const offset = thread.summarized_count;
+  // Skip summarized messages - they've been rolled into thread.summary.
+  // Anchor the window to the tail so new messages are always visible even if
+  // rolling summarization has stalled (summarized_count stops advancing).
+  const total = countChatMessages(thread.id);
+  const offset = Math.max(thread.summarized_count, total - 200);
   const messages = listChatMessages({ threadId: thread.id, limit: 200, order: "asc", offset });
   const runs = listChatRunsForThread(thread.id, 200);
   const runById = new Map(runs.map((r) => [r.id, r]));

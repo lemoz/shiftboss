@@ -381,10 +381,12 @@ export function GlobalAgentActivityFeed({
   }, [load]);
 
   useEffect(() => {
-    if (!session) return;
+    // Poll at full rate when a session is active, slower when idle so we notice
+    // a newly-started session even if none was active at mount.
+    const interval = session ? POLL_INTERVAL_MS : 30_000;
     const timer = window.setInterval(() => {
       void load();
-    }, POLL_INTERVAL_MS);
+    }, interval);
     return () => window.clearInterval(timer);
   }, [session, load]);
 
