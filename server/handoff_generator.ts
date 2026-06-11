@@ -26,7 +26,7 @@ import { listWorkOrders, type WorkOrder } from "./work_orders.js";
 
 const execFileAsync = promisify(execFile);
 const CLAUDE_TIMEOUT_MS = 60_000;
-const CLAUDE_HANDOFF_MODEL = "claude-3-5-sonnet-20241022";
+const CLAUDE_HANDOFF_MODEL = "claude-haiku-4-5-20251001";
 const DEFAULT_CODEX_MODEL = "gpt-5.3-codex";
 const CODEX_REASONING_EFFORT_CONFIG = 'model_reasoning_effort="xhigh"';
 const CODEX_TIMEOUT_MS = 60_000;
@@ -704,6 +704,7 @@ export async function generateAndStoreHandoff(params: {
       handoffContent = normalizeHandoffContent(parsed, fallback);
     } catch (err) {
       log(`handoff: ${settings.provider} failed, using fallback: ${String(err)}`);
+      console.warn(`[handoff] ${settings.provider} failed, using stub fallback (run ${params.runId}): ${String(err)}`);
       handoffContent = fallback;
     }
     recordCostEntry({
