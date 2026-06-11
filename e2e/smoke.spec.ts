@@ -45,11 +45,27 @@ function waitForThreadPatch(page: import("@playwright/test").Page, threadId: str
   );
 }
 
+/**
+ * Returns true for the benign Next.js RSC prefetch-fallback message that fires
+ * when a page.reload() races with an in-flight RSC link prefetch.  The router
+ * recovers automatically (falls back to a full browser navigation), so this
+ * noise must be filtered rather than treated as a test failure.
+ *
+ * Deliberately narrow: only matches messages with both the "Failed to fetch RSC
+ * payload" prefix AND the "Falling back to browser navigation" suffix so that
+ * genuine fetch errors are still caught.
+ */
+function isBenignNextNoise(text: string): boolean {
+  return /Failed to fetch RSC payload .* Falling back to browser navigation/.test(text);
+}
+
 function trackPageErrors(page: import("@playwright/test").Page) {
   const errors: string[] = [];
-  page.on("pageerror", (err) => errors.push(err.message));
+  page.on("pageerror", (err) => {
+    if (!isBenignNextNoise(err.message)) errors.push(err.message);
+  });
   page.on("console", (msg) => {
-    if (msg.type() === "error") errors.push(msg.text());
+    if (msg.type() === "error" && !isBenignNextNoise(msg.text())) errors.push(msg.text());
   });
   return errors;
 }
