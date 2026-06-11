@@ -4,7 +4,9 @@ import crypto from "crypto";
 import YAML from "yaml";
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
+import { csrfOriginGuard } from "./csrf_protection.js";
 import {
+  DEFAULT_DEV_PORTS,
   getAllowLan,
   getAllowRemoteHealth,
   getAllowedOrigins,
@@ -742,9 +744,8 @@ if (allowAllCorsRequested && !allowAllCors) {
   );
 }
 
-const defaultDevPorts = [3000, 3010, 3011, 3012, 3013];
 const allowedOrigins = new Set(
-  defaultDevPorts
+  DEFAULT_DEV_PORTS
     .flatMap((p) => [`http://localhost:${p}`, `http://127.0.0.1:${p}`])
     .concat(
       getAllowedOrigins()
@@ -785,6 +786,12 @@ app.use(
     methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
   })
 );
+// CSRF / origin enforcement: reject state-changing requests from cross-origin
+// browser contexts.  Must run after the CORS preflight handler (which handles
+// OPTIONS) and before route handlers so side effects are never reached.
+// Non-browser clients (no Origin, no Sec-Fetch-Site) are passed through
+// unchanged so CLI/API/agent usage is unaffected.
+app.use(csrfOriginGuard(allowedOrigins, { allowAll: allowAllCors }));
 app.use(express.json({ verify: captureRawBody }));
 
 app.get("/health", (_req, res) => {

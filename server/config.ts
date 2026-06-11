@@ -220,6 +220,24 @@ export function getAllowedOrigins(): string[] {
   return parseEnvList(readEnv("SHIFTBOSS_ALLOWED_ORIGINS"));
 }
 
+/**
+ * Default UI dev-server ports on loopback.
+ *
+ * IMPORTANT: this value must be kept in sync with DEFAULT_DEV_PORTS in
+ * lib/csrf-constants.ts.  The Next.js layer cannot import from server/ so the
+ * two files each carry their own copy; they are the same number.  A port
+ * change requires updating both files.
+ */
+export const DEFAULT_DEV_PORTS: readonly number[] = [3000, 3010, 3011, 3012, 3013];
+
+/**
+ * HTTP methods that carry side effects — subject to CSRF checks.
+ *
+ * IMPORTANT: must be kept in sync with MUTABLE_METHODS in lib/csrf-constants.ts.
+ * The Next.js layer cannot import from server/ so each side carries its own copy.
+ */
+export const MUTABLE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
 export function getNodeEnv(): string {
   return (process.env.NODE_ENV || "").trim();
 }
