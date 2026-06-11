@@ -17,6 +17,7 @@ const {
   isRunWorkerAlive,
   killTargetForPid,
   mergeContextFiles,
+  mergeNoTouch,
   parseProjectBuilderEnv,
   parsePullRequestUrl,
   readRunnerPid,
@@ -25,6 +26,7 @@ const {
   resolveResumeSkips,
   resolveBaseBranch,
   resolveWorktreePaths,
+  stageSafeChanges,
   writeRunnerPid,
 } = __test__;
 
@@ -318,7 +320,7 @@ test(
     );
     assert.equal(runGit(repoPath, ["show", `${sourceBranch}:work_orders/WO-0004.md`]), "updated");
     assert.ok(
-      logs.some((line) => line.includes(`Source branch "${sourceBranch}" is not checked out`))
+      logs.some((line) => line.includes("Auto-committed work_orders/ metadata updates"))
     );
   }
 );
@@ -812,4 +814,203 @@ test("isProcessAlive: current process is alive", () => {
   assert.equal(typeof result, "boolean");
   // If we are running, we should be alive (unless in a very unusual sandbox).
   assert.equal(result, true);
+});
+
+// --- stageSafeChanges: porcelain -z with space/quote filenames (E) ---
+
+function setupWorktree(t) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcc-safe-stage-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const wtPath = path.join(tmpDir, "wt");
+  fs.mkdirSync(wtPath, { recursive: true });
+  const result = spawnSync("git", ["init"], { cwd: wtPath, encoding: "utf8" });
+  if (result.status !== 0) throw new Error(result.stderr);
+  spawnSync("git", ["config", "user.email", "t@t.com"], { cwd: wtPath });
+  spawnSync("git", ["config", "user.name", "T"], { cwd: wtPath });
+  // Initial commit so HEAD exists
+  fs.writeFileSync(path.join(wtPath, "placeholder.txt"), "init\n", "utf8");
+  spawnSync("git", ["add", "."], { cwd: wtPath });
+  spawnSync("git", ["commit", "-m", "init"], { cwd: wtPath });
+  return wtPath;
+}
+
+test("stageSafeChanges stages a file whose name contains a space (E: porcelain -z)", (t) => {
+  const wtPath = setupWorktree(t);
+
+  const filename = "with space.txt";
+  fs.writeFileSync(path.join(wtPath, filename), "content\n", "utf8");
+
+  const logs = [];
+  const result = stageSafeChanges({ worktreePath: wtPath, log: (l) => logs.push(l) });
+  assert.equal(result.ok, true, `stageSafeChanges failed: ${JSON.stringify(result)}`);
+
+  // Verify the file is staged
+  const diff = spawnSync("git", ["diff", "--cached", "--name-only"], { cwd: wtPath, encoding: "utf8" });
+  assert.ok(diff.stdout.includes(filename), `Expected "${filename}" in staged output: ${diff.stdout}`);
+});
+
+test("stageSafeChanges stages a file whose name contains non-ASCII characters (E: porcelain -z)", (t) => {
+  const wtPath = setupWorktree(t);
+
+  const filename = "café.txt";
+  fs.writeFileSync(path.join(wtPath, filename), "content\n", "utf8");
+
+  const logs = [];
+  const result = stageSafeChanges({ worktreePath: wtPath, log: (l) => logs.push(l) });
+  assert.equal(result.ok, true, `stageSafeChanges failed: ${JSON.stringify(result)}`);
+
+  // Use --porcelain -z to check staged files (avoids C-quoting in the assertion itself)
+  const diff = spawnSync("git", ["diff", "--cached", "--name-only", "-z"], { cwd: wtPath, encoding: "utf8" });
+  const stagedFiles = diff.stdout.split("\0").filter(Boolean);
+  assert.ok(stagedFiles.some((f) => f === filename), `Expected "${filename}" in staged files: ${stagedFiles}`);
+});
+
+test("stageSafeChanges aborts when a protected path (work_orders/) is deleted (F: conflict path)", (t) => {
+  const wtPath = setupWorktree(t);
+
+  // Commit a work_orders/ file so it can be deleted
+  fs.mkdirSync(path.join(wtPath, "work_orders"), { recursive: true });
+  fs.writeFileSync(path.join(wtPath, "work_orders", "WO-001.md"), "---\nid: WO-001\n---\n", "utf8");
+  spawnSync("git", ["add", "work_orders/"], { cwd: wtPath });
+  spawnSync("git", ["commit", "-m", "add wo"], { cwd: wtPath });
+
+  // Delete it (simulate builder deletion)
+  fs.rmSync(path.join(wtPath, "work_orders", "WO-001.md"));
+
+  const logs = [];
+  const result = stageSafeChanges({ worktreePath: wtPath, log: (l) => logs.push(l) });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "protected_path_violation");
+  assert.ok(result.violations.some((v) => v.includes("WO-001.md")));
+
+  // The file should be restored from HEAD
+  assert.ok(fs.existsSync(path.join(wtPath, "work_orders", "WO-001.md")));
+});
+
+test("stageSafeChanges detects deleted protected path even when name would be C-quoted (E+F)", (t) => {
+  const wtPath = setupWorktree(t);
+
+  // Commit a work_orders/ file with a space in its name
+  fs.mkdirSync(path.join(wtPath, "work_orders"), { recursive: true });
+  const woName = "My Work Order.md";
+  fs.writeFileSync(path.join(wtPath, "work_orders", woName), "---\nid: WO-002\n---\n", "utf8");
+  spawnSync("git", ["add", "work_orders/"], { cwd: wtPath });
+  spawnSync("git", ["commit", "-m", "add spaced wo"], { cwd: wtPath });
+
+  // Delete it
+  fs.rmSync(path.join(wtPath, "work_orders", woName));
+
+  const logs = [];
+  const result = stageSafeChanges({ worktreePath: wtPath, log: (l) => logs.push(l) });
+  assert.equal(result.ok, false, "Expected protected_path_violation for work_orders/ file with space");
+  assert.equal(result.reason, "protected_path_violation");
+});
+
+// --- mergeNoTouch: no-touch merge helper (D) ---
+
+function setupMergeRepo(t) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pcc-merge-no-touch-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  const repoPath = path.join(tmpDir, "repo");
+  fs.mkdirSync(repoPath, { recursive: true });
+  runGit(repoPath, ["init"]);
+  runGit(repoPath, ["config", "user.email", "tester@example.com"]);
+  runGit(repoPath, ["config", "user.name", "Tester"]);
+  fs.writeFileSync(path.join(repoPath, "app.txt"), "base\n", "utf8");
+  runGit(repoPath, ["add", "."]);
+  runGit(repoPath, ["commit", "-m", "base"]);
+
+  const baseBranch = runGit(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  const runBranch = "run/WO-test-abc";
+  runGit(repoPath, ["checkout", "-b", runBranch]);
+  fs.appendFileSync(path.join(repoPath, "app.txt"), "feature\n", "utf8");
+  runGit(repoPath, ["add", "app.txt"]);
+  runGit(repoPath, ["commit", "-m", "feature"]);
+  runGit(repoPath, ["checkout", baseBranch]);
+
+  return { repoPath, baseBranch, runBranch };
+}
+
+test("mergeNoTouch merges run branch when base is not checked out (temp-worktree path)", (t) => {
+  const { repoPath, baseBranch, runBranch } = setupMergeRepo(t);
+
+  // Switch to a different branch so baseBranch is NOT checked out
+  runGit(repoPath, ["checkout", "-b", "other-work"]);
+
+  const logs = [];
+  const result = mergeNoTouch({
+    repoPath,
+    baseBranch,
+    branchName: runBranch,
+    mergeMessage: `Merge ${runBranch}`,
+    log: (l) => logs.push(l),
+  });
+
+  assert.equal(result.ok, true, `mergeNoTouch failed: ${JSON.stringify(result)}`);
+
+  // The base branch ref should now include the feature commit
+  const baseContent = spawnSync(
+    "git", ["show", `${baseBranch}:app.txt`],
+    { cwd: repoPath, encoding: "utf8" }
+  ).stdout;
+  assert.ok(baseContent.includes("feature"), `Expected "feature" in ${baseBranch}:app.txt`);
+
+  // The user's current branch (other-work) should be unchanged
+  const currentBranch = runGit(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  assert.equal(currentBranch, "other-work");
+});
+
+test("mergeNoTouch merges run branch when base IS currently checked out (checkout-restore path)", (t) => {
+  const { repoPath, baseBranch, runBranch } = setupMergeRepo(t);
+
+  // baseBranch IS checked out (default state after setupMergeRepo)
+  const currentBefore = runGit(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  assert.equal(currentBefore, baseBranch);
+
+  const logs = [];
+  const result = mergeNoTouch({
+    repoPath,
+    baseBranch,
+    branchName: runBranch,
+    mergeMessage: `Merge ${runBranch}`,
+    log: (l) => logs.push(l),
+  });
+
+  assert.equal(result.ok, true, `mergeNoTouch failed: ${JSON.stringify(result)}`);
+
+  // baseBranch should include the feature commit
+  const baseContent = runGit(repoPath, ["show", `${baseBranch}:app.txt`]);
+  assert.ok(baseContent.includes("feature"), `Expected "feature" in ${baseBranch}:app.txt`);
+
+  // After merge, branch should be restored to baseBranch (same branch, no switch needed)
+  const currentAfter = runGit(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  assert.equal(currentAfter, baseBranch);
+});
+
+// --- resolveBaseBranch from WO base_branch (C) ---
+
+test("resolveBaseBranch uses woBaseBranch when run source_branch is null and WO base_branch set", (t) => {
+  const repoPath = setupRepo(t);
+  // Create a 'develop' branch and stay on another branch
+  runGit(repoPath, ["branch", "develop"]);
+  runGit(repoPath, ["checkout", "-b", "feature"]);
+
+  const base = resolveBaseBranch(repoPath, () => {}, {
+    runSourceBranch: null,
+    woBaseBranch: "develop",
+  });
+  assert.equal(base, "develop");
+});
+
+test("resolveBaseBranch falls through to current HEAD when both source_branch and woBaseBranch are null", (t) => {
+  const repoPath = setupRepo(t);
+  runGit(repoPath, ["checkout", "-b", "my-feature"]);
+
+  const base = resolveBaseBranch(repoPath, () => {}, {
+    runSourceBranch: null,
+    woBaseBranch: null,
+  });
+  assert.equal(base, "my-feature");
 });

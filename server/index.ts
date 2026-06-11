@@ -271,6 +271,7 @@ import {
   markConstitutionGenerationComplete,
 } from "./constitution_generation.js";
 import {
+  abortStaleMergeHead,
   autoCancelEscalationTimeouts,
   abortSecurityHoldRun,
   cancelRun,
@@ -6816,6 +6817,28 @@ const failRunsOnRestart =
 const recovered = failRunsOnRestart
   ? markInProgressRunsFailed("Server restarted; run aborted.", isRunWorkerAlive)
   : 0;
+
+// H: On startup, scan all projects and abort any stale in-progress merges
+// (MERGE_HEAD left by a killed/crashed worker) so subsequent merges can proceed.
+{
+  const startupLog = (line: string) => {
+    // eslint-disable-next-line no-console
+    console.log(`[startup-merge-recovery] ${line}`);
+  };
+  try {
+    const allProjects = listProjects();
+    for (const proj of allProjects) {
+      try {
+        abortStaleMergeHead(proj.path, startupLog);
+      } catch {
+        // ignore per-project errors
+      }
+    }
+  } catch {
+    // ignore startup sweep errors
+  }
+}
+
 app.listen(port, host, () => {
   // eslint-disable-next-line no-console
   console.log(`Shiftboss server listening on http://${host}:${port}`);
