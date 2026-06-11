@@ -10,7 +10,8 @@ import {
   getShiftModelOverride,
   getShiftPromptPathOverride,
 } from "./config.js";
-import { getShiftByProjectId, updateShift, type ShiftRow } from "./db.js";
+import { getShiftByProjectId, registerJob, updateShift, type ShiftRow } from "./db.js";
+import { killProcessTree } from "./agent_execution.js";
 
 type ShiftLogTail = { lines: string[]; has_more: boolean; log_path: string };
 
@@ -106,19 +107,22 @@ function recordSpawnFailure(params: {
   });
 }
 
-function terminateProcess(pid: number): void {
+/**
+ * Terminate the shift agent's process group unconditionally.
+ * Uses killProcessTree (SIGCONT+SIGTERM+SIGKILL) so a SIGSTOP'd process
+ * actually receives and acts on the signal.
+ */
+export async function terminateShiftProcess(pid: number, logPath?: string): Promise<void> {
   try {
-    if (process.platform === "win32") {
-      process.kill(pid);
-    } else {
-      process.kill(-pid, "SIGTERM");
+    await killProcessTree(pid);
+  } catch (err) {
+    if (logPath) {
+      appendShiftLog(logPath, `[terminate] killProcessTree pid=${pid} error: ${String(err)}`);
     }
-  } catch {
-    // Ignore if process already exited.
   }
 }
 
-function scheduleShiftTimeout(params: {
+export function scheduleShiftTimeout(params: {
   projectId: string;
   shiftId: string;
   pid: number;
@@ -130,18 +134,28 @@ function scheduleShiftTimeout(params: {
   if (!Number.isFinite(expiresAtMs)) return;
   const delayMs = Math.max(0, expiresAtMs - Date.now());
   const timer = setTimeout(() => {
-    const shift = getShiftByProjectId(params.projectId, params.shiftId);
-    if (!shift || shift.status !== "active") return;
-    updateShift(shift.id, {
-      status: "expired",
-      completed_at: new Date().toISOString(),
-      error: "Shift expired",
-    });
+    // Kill the process regardless of current row status.  The original check
+    // `shift.status !== "active"` caused the timer to bail when the row had
+    // already been marked expired/failed by another path (sweep race), leaving
+    // the claude process running unbounded.
     appendShiftLog(
       params.logPath,
-      `[timeout] Shift expired; terminating pid ${params.pid}`
+      `[timeout] Shift timer fired; terminating pid ${params.pid}`
     );
-    terminateProcess(params.pid);
+    // Update the DB row only if the shift is still active.  Another path (sweep
+    // race, abandon, reaper) may have already transitioned the row — we must
+    // not overwrite that state.  The process kill below is unconditional: even
+    // if the row has already been marked expired/failed, the process might still
+    // be running.
+    const shift = getShiftByProjectId(params.projectId, params.shiftId);
+    if (shift?.status === "active") {
+      updateShift(shift.id, {
+        status: "expired",
+        completed_at: new Date().toISOString(),
+        error: "Shift expired",
+      });
+    }
+    void terminateShiftProcess(params.pid, params.logPath);
   }, delayMs);
   if (typeof timer.unref === "function") timer.unref();
 }
@@ -199,33 +213,58 @@ export function spawnShiftAgent(params: {
     }
   );
   fs.closeSync(logFd);
+
+  // NOTE: Do NOT call recordSpawnFailure (which sets status='failed') from
+  // here.  That would cause spawnShiftAgentWithRetry's retry attempt to run
+  // against a shift row already marked failed, breaking the scheduler's
+  // single-active-shift invariant.  The caller (spawnShiftAgentWithRetry or
+  // the HTTP route) is responsible for marking the shift failed only after all
+  // retry attempts are exhausted.
   child.once("error", (error) => {
-    recordSpawnFailure({
-      projectId: params.projectId,
-      shiftId: params.shift.id,
-      logPath: absolutePath,
-      error,
+    // Log the spawn error but do NOT touch the DB row — caller handles it.
+    appendShiftLog(absolutePath, `[spawn-error] ${error.message}`);
+  });
+
+  if (!child.pid) {
+    throw new Error("Shift agent failed to start");
+  }
+
+  const pid = child.pid;
+
+  // Persist the pid so the reaper and startup recovery can kill orphans.
+  updateShift(params.shift.id, { pid });
+
+  // Register in the jobs table so the reaper covers every spawn path (HTTP
+  // route, scheduler, and global-agent inline spawn) — no call site can forget
+  // this because it lives here at the single spawn point.
+  registerJob({ kind: "shift", ref_id: params.shift.id, pid });
+
+  // Attach exit listener (works even after unref while the server lives).
+  // If the agent exits without having completed or handed off the shift, mark
+  // it failed immediately rather than waiting the full 120-minute timeout.
+  child.once("exit", (code, signal) => {
+    const shift = getShiftByProjectId(params.projectId, params.shift.id);
+    if (!shift || shift.status !== "active") return; // already completed/expired
+    const reason = signal
+      ? `Shift agent exited with signal ${signal}`
+      : `Shift agent exited with code ${code ?? "unknown"}`;
+    appendShiftLog(absolutePath, `[exit] ${reason}`);
+    updateShift(params.shift.id, {
+      status: "failed",
+      completed_at: new Date().toISOString(),
+      error: reason,
     });
   });
-  if (!child.pid) {
-    const error = new Error("Shift agent failed to start");
-    recordSpawnFailure({
-      projectId: params.projectId,
-      shiftId: params.shift.id,
-      logPath: absolutePath,
-      error,
-    });
-    throw error;
-  }
+
   scheduleShiftTimeout({
     projectId: params.projectId,
     shiftId: params.shift.id,
-    pid: child.pid,
+    pid,
     expiresAt: params.shift.expires_at,
     logPath: absolutePath,
   });
   child.unref();
-  return { pid: child.pid, log_path: relativePath };
+  return { pid, log_path: relativePath };
 }
 
 function tailLines(

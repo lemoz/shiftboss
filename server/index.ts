@@ -301,10 +301,12 @@ import {
   tailRunLog,
 } from "./observability.js";
 import { readControlMetadata } from "./sidecar.js";
-import { resolveShiftLogPaths, spawnShiftAgent, tailShiftLog } from "./shift_agent.js";
+import { resolveShiftLogPaths, spawnShiftAgent, tailShiftLog, terminateShiftProcess } from "./shift_agent.js";
+import { startJobSupervisor } from "./job_supervisor.js";
 import {
   getShiftSchedulerStatus,
   notifyShiftSchedulerSettingsUpdated,
+  recoverActiveShifts,
   startShiftScheduler,
 } from "./shift_scheduler.js";
 import {
@@ -402,9 +404,9 @@ function resolveEscalationTimeoutHours(): number {
 
 function startEscalationTimeoutSweep(): void {
   const timeoutHours = resolveEscalationTimeoutHours();
-  const sweep = () => {
+  const sweep = async () => {
     try {
-      const result = autoCancelEscalationTimeouts(timeoutHours);
+      const result = await autoCancelEscalationTimeouts(timeoutHours);
       if (result.canceled > 0) {
         // eslint-disable-next-line no-console
         console.log(
@@ -420,8 +422,8 @@ function startEscalationTimeoutSweep(): void {
     }
   };
 
-  sweep();
-  setInterval(sweep, ESCALATION_TIMEOUT_SWEEP_MS);
+  void sweep();
+  setInterval(() => { void sweep(); }, ESCALATION_TIMEOUT_SWEEP_MS);
 }
 
 function startSlackConversationSweep(): void {
@@ -4912,6 +4914,12 @@ app.post("/projects/:id/shifts/:shiftId/abandon", (req, res) => {
     return res.status(500).json({ error: "failed to update shift" });
   }
 
+  // Kill the agent process if a pid was persisted.  Without this, the detached
+  // claude process keeps running after abandon (finding 121/134).
+  if (shift.pid) {
+    void terminateShiftProcess(shift.pid);
+  }
+
   const updatedShift =
     getShiftByProjectId(project.id, shiftId) ??
     ({
@@ -6914,11 +6922,21 @@ app.listen(port, host, () => {
     // eslint-disable-next-line no-console
     console.log(`Marked ${recovered} in-progress runs as failed (restart recovery).`);
   }
-  startEscalationTimeoutSweep();
-  startSlackConversationSweep();
-  startSmsConversationSweep();
-  startShiftScheduler();
-  startAutopilotScheduler();
-  startConversationBackgroundSync();
-  recoverAutonomousSessionLoop();
+  // Use an immediately-invoked async wrapper so we can await recoverActiveShifts
+  // before starting the shift scheduler.  Without await, the scheduler's first
+  // expireStaleShifts tick can run before recovery timers are re-armed.
+  void (async () => {
+    // Re-arm expiry timers for shifts that were active when the server was last
+    // running.  Must complete before startShiftScheduler so the scheduler sees
+    // the timers as already in place before it potentially starts new shifts.
+    await recoverActiveShifts();
+    startJobSupervisor();
+    startEscalationTimeoutSweep();
+    startSlackConversationSweep();
+    startSmsConversationSweep();
+    startShiftScheduler();
+    startAutopilotScheduler();
+    startConversationBackgroundSync();
+    recoverAutonomousSessionLoop();
+  })();
 });

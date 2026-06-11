@@ -6,7 +6,7 @@ import {
   getGlobalAgentSessionMaxDurationMinutes,
   getGlobalAgentSessionMaxIterations,
 } from "./config.js";
-import { getDb, updateGlobalShift } from "./db.js";
+import { beatJob, completeJob, getDb, getJobByRefId, registerJob, updateGlobalShift } from "./db.js";
 import { runGlobalAgentShift, type GlobalAgentRunResult } from "./global_agent.js";
 import type { GlobalDecisionSessionContext } from "./prompts/global_decision.js";
 
@@ -984,9 +984,34 @@ export function recoverAutonomousSessionLoop(): void {
 async function startSessionLoop(sessionId: string): Promise<void> {
   if (ACTIVE_SESSION_LOOPS.has(sessionId)) return;
   ACTIVE_SESSION_LOOPS.add(sessionId);
+  // Register in the jobs table so the reaper can detect a stuck/crashed session
+  // loop.  Global sessions run in-process, so we tick beatJob on each iteration
+  // via the heartbeat timer below.
+  let jobId: string | null = null;
+  const existingJob = getJobByRefId(sessionId);
+  if (existingJob) {
+    jobId = existingJob.id;
+  } else {
+    const job = registerJob({ kind: "global_session", ref_id: sessionId, pid: null });
+    jobId = job.id;
+  }
+  // Heartbeat timer: tick every 30s so the reaper (threshold = 3 × 60s) has
+  // plenty of margin even for a stuck LLM call.
+  const heartbeatTimer = setInterval(() => {
+    if (jobId) beatJob(jobId);
+  }, 30_000);
+
   try {
     await runSessionLoop(sessionId);
+    // Mark the job done on clean exit.
+    if (jobId) completeJob(jobId, "done");
+  } catch (err) {
+    // Loop threw — mark failed before re-throwing so the reaper doesn't
+    // report a spurious 'done' status for a crashed session.
+    if (jobId) completeJob(jobId, "failed");
+    throw err;
   } finally {
+    clearInterval(heartbeatTimer);
     ACTIVE_SESSION_LOOPS.delete(sessionId);
   }
 }

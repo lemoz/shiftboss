@@ -3,14 +3,16 @@ import {
   countShiftsSince,
   expireStaleShifts,
   getActiveShift,
+  getDb,
   getLatestShift,
+  listActiveShiftsWithPid,
   listAutoShiftProjects,
   startShift,
   updateShift,
   type ProjectRow,
   type ShiftRow,
 } from "./db.js";
-import { spawnShiftAgent } from "./shift_agent.js";
+import { spawnShiftAgent, scheduleShiftTimeout, terminateShiftProcess, resolveShiftLogPaths } from "./shift_agent.js";
 import { getShiftSchedulerSettings, type ShiftSchedulerSettings } from "./settings.js";
 
 export type ShiftSchedulerActivity = {
@@ -92,6 +94,7 @@ async function spawnShiftAgentForProject(
   project: ProjectRow,
   shift: ShiftRow
 ): Promise<void> {
+  // registerJob is called inside spawnShiftAgent so all call sites are covered.
   spawnShiftAgent({ projectId: project.id, projectPath: project.path, shift });
 }
 
@@ -242,4 +245,55 @@ export function getShiftSchedulerStatus(): ShiftSchedulerStatus {
     ...status,
     recent_activity: [...status.recent_activity],
   };
+}
+
+/**
+ * On server startup, re-arm expiry timers for active shifts that have a
+ * persisted pid and kill any that are already past their expires_at.
+ *
+ * Without this, a server restart loses all in-memory setTimeout handles,
+ * leaving detached claude processes running indefinitely (finding 124).
+ */
+export async function recoverActiveShifts(): Promise<void> {
+  const activeShifts = listActiveShiftsWithPid();
+  const now = Date.now();
+  for (const shift of activeShifts) {
+    const expiresAtMs = shift.expires_at ? Date.parse(shift.expires_at) : null;
+    if (!shift.pid) continue;
+
+    if (expiresAtMs && expiresAtMs <= now) {
+      // Already past deadline — kill immediately.
+      const message = "Shift expired during server restart";
+      updateShift(shift.id, {
+        status: "expired",
+        completed_at: new Date().toISOString(),
+        error: message,
+      });
+      await terminateShiftProcess(shift.pid);
+      recordActivity(`Killed expired shift ${shift.id} (pid ${shift.pid}) on recovery.`);
+      continue;
+    }
+
+    // Still within its window — re-arm the kill timer.
+    // We need the log path: it lives under project path.  Resolve it from
+    // the project record via the project_id stored on the shift.
+    try {
+      const projectRow = getDb()
+        .prepare("SELECT path FROM projects WHERE id = ? LIMIT 1")
+        .get(shift.project_id) as { path: string } | undefined;
+      if (!projectRow) continue;
+      const { absolutePath } = resolveShiftLogPaths(projectRow.path, shift.id);
+      scheduleShiftTimeout({
+        projectId: shift.project_id,
+        shiftId: shift.id,
+        pid: shift.pid,
+        expiresAt: shift.expires_at,
+        logPath: absolutePath,
+      });
+      recordActivity(`Re-armed timeout for shift ${shift.id} (pid ${shift.pid}).`);
+    } catch {
+      // Best-effort: if we can't re-arm, the scheduler's expireStaleShifts
+      // will clean it up on the next tick when expires_at passes.
+    }
+  }
 }
